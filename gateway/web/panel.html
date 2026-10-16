@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>139 灵犀网关 · 控制台</title>
+<style>
+  :root{
+    --bg:#0b1220; --bg-soft:#111a2e; --card:#151f36; --card-2:#1b2740; --line:#243350;
+    --text:#e6edf7; --muted:#8ba0bf; --dim:#5f7391;
+    --brand:#3b82f6; --brand-2:#22d3ee; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --violet:#8b5cf6;
+    --radius:14px; --shadow:0 10px 30px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:radial-gradient(1200px 600px at 15% -10%, #16233d 0%, var(--bg) 55%) fixed;
+    color:var(--text); font:14px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .shell{display:grid;grid-template-columns:236px 1fr;min-height:100vh}
+  /* ---------- 侧边栏 ---------- */
+  aside{background:linear-gradient(180deg,#0e1729,#0b1220);border-right:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh}
+  .brand{display:flex;align-items:center;gap:10px;padding:6px 8px 16px}
+  .brand .logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand-2));display:grid;place-items:center;font-weight:800;color:#04101f;font-size:15px;box-shadow:0 6px 18px rgba(59,130,246,.35)}
+  .brand b{font-size:15px;letter-spacing:.2px}
+  .brand small{display:block;color:var(--dim);font-size:11px;font-weight:400}
+  nav a{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:10px;color:var(--muted);text-decoration:none;cursor:pointer;font-weight:500;transition:.15s}
+  nav a:hover{background:#16233c;color:var(--text)}
+  nav a.active{background:linear-gradient(90deg,rgba(59,130,246,.22),rgba(34,211,238,.08));color:#fff;box-shadow:inset 0 0 0 1px rgba(59,130,246,.35)}
+  nav a .ico{width:18px;text-align:center;opacity:.9}
+  .side-foot{margin-top:auto;padding:10px;border-top:1px solid var(--line);color:var(--dim);font-size:11.5px;display:flex;flex-direction:column;gap:4px}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)} .dot.off{background:var(--err);box-shadow:0 0 8px var(--err)}
+  /* ---------- 主区 ---------- */
+  main{padding:22px 26px 40px;max-width:1280px}
+  header.page{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:18px}
+  header.page h1{margin:0;font-size:20px;letter-spacing:.2px}
+  header.page p{margin:5px 0 0;color:var(--muted);font-size:12.5px}
+  .btn{border:1px solid var(--line);background:var(--card-2);color:var(--text);padding:8px 14px;border-radius:10px;cursor:pointer;font-weight:600;font-size:13px;transition:.15s;display:inline-flex;align-items:center;gap:7px}
+  .btn:hover{background:#233257;border-color:#33507f}
+  .btn.primary{background:linear-gradient(135deg,var(--brand),#2563eb);border-color:transparent;box-shadow:0 6px 18px rgba(37,99,235,.32)}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn.ghost{background:transparent}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .grid{display:grid;gap:14px}
+  .cols-4{grid-template-columns:repeat(4,1fr)} .cols-3{grid-template-columns:repeat(3,1fr)} .cols-2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:1080px){.cols-4{grid-template-columns:repeat(2,1fr)}.cols-3,.cols-2{grid-template-columns:1fr}.shell{grid-template-columns:64px 1fr}aside .brand b,aside .brand small,nav a span.lbl,.side-foot{display:none}}
+  .card{background:linear-gradient(180deg,var(--card),#131c31);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+  .card h3{margin:0 0 12px;font-size:13px;color:var(--muted);font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;gap:8px}
+  .kpi{font-size:26px;font-weight:750;letter-spacing:-.5px}
+  .kpi small{font-size:12.5px;color:var(--muted);font-weight:500;margin-left:6px}
+  .sub{color:var(--muted);font-size:12px;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid transparent}
+  .badge.ok{background:rgba(34,197,94,.13);color:#4ade80;border-color:rgba(34,197,94,.3)}
+  .badge.warn{background:rgba(245,158,11,.13);color:#fbbf24;border-color:rgba(245,158,11,.3)}
+  .badge.err{background:rgba(239,68,68,.13);color:#f87171;border-color:rgba(239,68,68,.3)}
+  .badge.info{background:rgba(59,130,246,.13);color:#60a5fa;border-color:rgba(59,130,246,.3)}
+  .badge.mute{background:#1b2740;color:var(--muted);border-color:var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--dim);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:9px 10px;border-bottom:1px solid rgba(36,51,80,.55)}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(59,130,246,.06)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  /* 图表 */
+  .bars{display:flex;align-items:flex-end;gap:6px;height:176px;padding:10px 2px 0;overflow:hidden}
+  .bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:3px;min-width:0}
+  .bar .stick{width:100%;border-radius:6px 6px 3px 3px;background:linear-gradient(180deg,var(--brand-2),var(--brand));min-height:3px;transition:.3s;position:relative}
+  .bar:hover .stick{filter:brightness(1.15)}
+  .bar .t{font-size:9.5px;color:var(--dim);white-space:nowrap;line-height:1.2;min-height:12px}
+  .bar .v{font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums;min-height:13px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:8px}
+  .legend i{width:9px;height:9px;border-radius:3px;display:inline-block;margin-right:6px}
+  /* 表单 */
+  label.f{display:block;color:var(--muted);font-size:12px;margin:12px 0 5px;font-weight:600}
+  input,textarea,select{width:100%;background:#0e1729;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:10px 12px;font-size:13px;font-family:inherit;outline:none;transition:.15s}
+  input:focus,textarea:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(59,130,246,.16)}
+  textarea{min-height:96px;resize:vertical;font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.5}
+  .hint{color:var(--dim);font-size:11.5px;margin-top:6px;line-height:1.6}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+  .toast{position:fixed;right:22px;bottom:22px;display:flex;flex-direction:column;gap:9px;z-index:99}
+  .toast .t{background:#16233c;border:1px solid var(--line);border-left:3px solid var(--brand);border-radius:10px;padding:11px 14px;box-shadow:var(--shadow);max-width:380px;animation:in .2s ease}
+  .toast .t.ok{border-left-color:var(--ok)} .toast .t.err{border-left-color:var(--err)} .toast .t.warn{border-left-color:var(--warn)}
+  @keyframes in{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+  .sect{display:none} .sect.active{display:block}
+  .spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;display:inline-block}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:12.5px}
+  .kv b{color:var(--dim);font-weight:600}
+  .steps{counter-reset:s;display:flex;flex-direction:column;gap:9px;margin:10px 0 0;padding:0;list-style:none}
+  .steps li{display:flex;gap:10px;color:var(--muted);font-size:12.5px;line-height:1.6}
+  .steps li::before{counter-increment:s;content:counter(s);flex:0 0 20px;height:20px;border-radius:50%;background:#1e2c49;color:#9fb6d8;display:grid;place-items:center;font-size:11px;font-weight:700}
+  code{background:#0e1729;border:1px solid var(--line);border-radius:6px;padding:1.5px 6px;font-size:11.5px;font-family:ui-monospace,Menlo,monospace;color:#a5c8ff}
+  .flex{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  .sep{height:1px;background:var(--line);margin:16px 0}
+  .empty{color:var(--dim);text-align:center;padding:26px 0;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <div class="brand">
+      <div class="logo">139</div>
+      <div><b>灵犀网关</b><small>139 AI 工作台 → OpenAI</small></div>
+    </div>
+    <nav>
+      <a data-tab="overview" class="active"><span class="ico">◉</span><span class="lbl">总览</span></a>
+      <a data-tab="account"><span class="ico">◈</span><span class="lbl">账号与续期</span></a>
+      <a data-tab="usage"><span class="ico">▤</span><span class="lbl">调用统计</span></a>
+      <a data-tab="logs"><span class="ico">≣</span><span class="lbl">调用日志</span></a>
+      <a data-tab="models"><span class="ico">◇</span><span class="lbl">模型</span></a>
+      <a data-tab="settings"><span class="ico">⚙</span><span class="lbl">设置</span></a>
+    </nav>
+    <div class="side-foot">
+      <div><span class="dot off" id="footDot"></span><span id="footState">连接中…</span></div>
+      <div class="mono" id="footPort">:—</div>
+      <div id="footVer">v—</div>
+    </div>
+  </aside>
+
+  <main>
+    <!-- ============ 总览 ============ -->
+    <section class="sect active" id="s-overview">
+      <header class="page">
+        <div><h1>总览</h1><p>账号状态、凭据有效期与今日调用概况</p></div>
+        <div class="flex">
+          <button class="btn" id="btnProbe">检测本机 Chrome</button>
+          <button class="btn" id="btnRenewTop">一键续期</button>
+          <button class="btn primary" id="btnRefresh">刷新</button>
+        </div>
+      </header>
+
+      <div class="grid cols-4" style="margin-bottom:14px">
+        <div class="card">
+          <h3>账号</h3>
+          <div class="kpi" id="kPhone">—</div>
+          <div class="sub"><span id="kSid" class="mono">sid —</span></div>
+          <div class="sub" id="kCookieWrap"><span class="badge mute" id="kCookie">cookie —</span><span class="badge mute" id="kRmkey">RMKEY —</span></div>
+        </div>
+        <div class="card">
+          <h3>Token 有效期</h3>
+          <div class="kpi" id="kExpiry">—</div>
+          <div class="sub"><span id="kExpiryAt">—</span></div>
+          <div class="sub"><span class="badge mute" id="kTokenState">未铸造</span></div>
+        </div>
+        <div class="card">
+          <h3>今日调用</h3>
+          <div class="kpi" id="kTodayCalls">0<small>次</small></div>
+          <div class="sub"><span id="kTodayTokens">0 tokens</span><span id="kTodayErr">0 失败</span></div>
+        </div>
+        <div class="card">
+          <h3>服务</h3>
+          <div class="kpi" id="kUptime">—</div>
+          <div class="sub"><span class="mono" id="kBaseURL">—</span></div>
+          <div class="sub"><span class="badge info" id="kModelState">模型 —</span></div>
+        </div>
+      </div>
+
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>近 14 天调用趋势</h3>
+          <div class="bars" id="miniBars"><div class="empty">暂无数据</div></div>
+          <div class="legend"><span><i style="background:linear-gradient(180deg,#22d3ee,#3b82f6)"></i>调用次数</span></div>
+        </div>
+        <div class="card">
+          <h3>模型分布（近 14 天）</h3>
+          <table><thead><tr><th>模型</th><th class="num">调用</th><th class="num">输出 tokens</th><th class="num">成功率</th></tr></thead>
+          <tbody id="miniModels"><tr><td colspan="4" class="empty">暂无数据</td></tr></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 账号与续期 ============ -->
+    <section class="sect" id="s-account">
+      <header class="page">
+        <div><h1>账号与续期</h1><p>连接 139 邮箱账号：自动抓取 / 粘贴导入 / 重铸 token</p></div>
+      </header>
+
+      <div class="grid cols-2">
+        <div class="card">
+          <h3 id="autoTitle">方式一 · 从本机 Chrome 自动抓取</h3>
+          <p class="hint" id="autoDesc">从已登录 139 邮箱的 Chrome 读取 cookie（含 httpOnly 的 RMKEY / Os_SSo_Sid），<b>无需手工导出</b>。</p>
+          <ol class="steps" id="autoSteps">
+            <li>正常登录 <code>mail.10086.cn</code>（可用「打开邮箱登录页」按钮）</li>
+            <li>Chrome 需以调试模式运行：<code>--remote-debugging-port=9222</code>（App 内启动会自动带上）</li>
+            <li>点击下方按钮抓取并验证</li>
+          </ol>
+          <div class="row">
+            <button class="btn primary" id="btnAuto" disabled>抓取并保存</button>
+            <button class="btn" id="btnAutoDry">仅试抓取</button>
+            <button class="btn ghost" id="btnOpenMail">打开邮箱登录页</button>
+          </div>
+          <div class="hint" id="chromeState" style="margin-top:10px">正在探测调试端口…</div>
+        </div>
+
+        <div class="card">
+          <h3>方式二 · 粘贴导入</h3>
+          <p class="hint">从 DevTools 复制：Network 中 <code>smsrebuild10.mail.10086.cn</code> 请求的完整 Cookie 头 + webai URL 的 <code>sid</code>（也可直接粘贴 Cookie，sid 会自动从 <code>Os_SSo_Sid</code> 提取）。</p>
+          <label class="f">sid</label>
+          <input id="inSid" placeholder="03c5MjEzMjcw…（留空则从 cookie 的 Os_SSo_Sid 提取）" />
+          <label class="f">Cookie</label>
+          <textarea id="inCookie" placeholder="RMKEY=...; Os_SSo_Sid=...; JSESSIONID=..."></textarea>
+          <div class="row">
+            <button class="btn primary" id="btnPaste">验证并保存</button>
+            <button class="btn" id="btnRenew">重铸 Token</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <h3>当前凭据</h3>
+        <div class="kv" id="credDetail"></div>
+      </div>
+    </section>
+
+    <!-- ============ 调用统计 ============ -->
+    <section class="sect" id="s-usage">
+      <header class="page">
+        <div><h1>调用统计</h1><p>按模型 × 按天的调用量与输出估算</p></div>
+        <div class="flex">
+          <select id="selDays" style="width:auto">
+            <option value="7">近 7 天</option><option value="14" selected>近 14 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option>
+          </select>
+          <button class="btn" id="btnUsageRefresh">刷新</button>
+        </div>
+      </header>
+      <div class="grid cols-4" style="margin-bottom:14px">
+        <div class="card"><h3>总调用</h3><div class="kpi" id="uCalls">0</div><div class="sub" id="uCallsSub">—</div></div>
+        <div class="card"><h3>输出 tokens</h3><div class="kpi" id="uTokens">0</div><div class="sub" id="uTokensSub">—</div></div>
+        <div class="card"><h3>成功率</h3><div class="kpi" id="uRate">—</div><div class="sub" id="uRateSub">—</div></div>
+        <div class="card"><h3>平均耗时</h3><div class="kpi" id="uLatency">—</div><div class="sub" id="uLatencySub">—</div></div>
+      </div>
+      <div class="card" style="margin-bottom:14px">
+        <h3>按天趋势</h3>
+        <div class="bars" id="usageBars"><div class="empty">暂无数据</div></div>
+        <div class="legend"><span><i style="background:linear-gradient(180deg,#22d3ee,#3b82f6)"></i>调用次数</span><span><i style="background:linear-gradient(180deg,#a78bfa,#8b5cf6)"></i>输出 tokens（右轴比例）</span></div>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>按模型</h3>
+          <table><thead><tr><th>模型</th><th class="num">调用</th><th class="num">成功/失败</th><th class="num">输入字</th><th class="num">输出字</th><th class="num">tokens</th><th class="num">平均耗时</th></tr></thead>
+          <tbody id="usageModels"><tr><td colspan="7" class="empty">暂无数据</td></tr></tbody></table>
+        </div>
+        <div class="card">
+          <h3>按天明细</h3>
+          <table><thead><tr><th>日期</th><th class="num">调用</th><th class="num">思考</th><th class="num">联网</th><th class="num">tokens</th><th class="num">失败</th></tr></thead>
+          <tbody id="usageDays"><tr><td colspan="6" class="empty">暂无数据</td></tr></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 调用日志 ============ -->
+    <section class="sect" id="s-logs">
+      <header class="page">
+        <div><h1>调用日志</h1><p>最近请求明细（倒序）</p></div>
+        <div class="flex"><button class="btn" id="btnLogsRefresh">刷新</button></div>
+      </header>
+      <div class="card">
+        <table><thead><tr><th>时间</th><th>模型</th><th>标记</th><th class="num">输入字</th><th class="num">输出字</th><th class="num">tokens</th><th class="num">耗时</th><th>结果</th></tr></thead>
+        <tbody id="logRows"><tr><td colspan="8" class="empty">暂无数据</td></tr></tbody></table>
+      </div>
+    </section>
+
+    <!-- ============ 模型 ============ -->
+    <section class="sect" id="s-models">
+      <header class="page"><div><h1>模型</h1><p>139 上游可用模型与累计用量</p></div></header>
+      <div class="card">
+        <table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">输入上限</th><th>思考</th><th class="num">累计调用</th><th class="num">累计 tokens</th><th class="num">失败</th></tr></thead>
+        <tbody id="modelRows"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody></table>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="sect" id="s-settings">
+      <header class="page"><div><h1>设置</h1><p>网关运行参数（写入 config.json）</p></div></header>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>运行参数</h3>
+          <label class="f">监听端口（修改后需重启）</label>
+          <input id="setPort" type="number" min="1" max="65535" />
+          <label class="f">默认模型</label>
+          <select id="setModel"></select>
+          <label class="f">网关 API Key（留空=不鉴权）</label>
+          <input id="setApiKey" placeholder="sk-…" />
+          <div class="row"><button class="btn primary" id="btnSaveCfg">保存设置</button></div>
+        </div>
+        <div class="card">
+          <h3>接入信息</h3>
+          <div class="kv">
+            <b>Base URL</b><span class="mono" id="cfgBase">—</span>
+            <b>对话端点</b><span class="mono" id="cfgChat">—</span>
+            <b>模型列表</b><span class="mono" id="cfgModels">—</span>
+            <b>管理令牌</b><span class="mono">已注入当前页面</span>
+          </div>
+          <div class="sep"></div>
+          <p class="hint">OpenAI 兼容客户端（OpenBitFun / OpenAI SDK / Claude Code）把 Base URL 指向上方地址即可；<code>tools</code> 工具调用由网关以文本协议模拟，无需额外配置。</p>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN = "__ADMIN_TOKEN__";
+const $ = (s) => document.querySelector(s);
+const fmtN = (n) => (n ?? 0).toLocaleString("zh-CN");
+const fmtTok = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n ?? 0);
+const fmtDur = (ms) => { if (!ms && ms !== 0) return "—"; const s = Math.round(ms / 1000); if (s < 60) return s + "s"; const m = Math.floor(s / 60); return m + "m" + (s % 60) + "s"; };
+const fmtLeft = (ms) => { if (ms == null) return "—"; if (ms <= 0) return "已过期"; const d = Math.floor(ms / 86400000), h = Math.floor((ms % 86400000) / 3600000); if (d > 0) return d + " 天 " + h + " 小时"; const m = Math.floor((ms % 3600000) / 60000); return h + " 小时 " + m + " 分"; };
+const fmtTime = (ts) => ts ? new Date(ts).toLocaleString("zh-CN", { hour12: false }) : "—";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(path, opts = {}) {
+  const res = await fetch("/admin/api" + path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", "X-Admin-Token": TOKEN, ...(opts.headers || {}) },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok && data.error) throw new Error(data.error);
+  return data;
+}
+
+function toast(msg, kind = "info", ms = 4200) {
+  const el = document.createElement("div");
+  el.className = "t " + kind;
+  el.innerHTML = msg;
+  $("#toast").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = ".3s"; setTimeout(() => el.remove(), 320); }, ms);
+}
+
+/* ---------- 标签切换 ---------- */
+document.querySelectorAll("nav a").forEach((a) => a.addEventListener("click", () => {
+  document.querySelectorAll("nav a").forEach((x) => x.classList.toggle("active", x === a));
+  const tab = a.dataset.tab;
+  document.querySelectorAll(".sect").forEach((s) => s.classList.toggle("active", s.id === "s-" + tab));
+  if (tab === "usage") loadUsage();
+  if (tab === "logs") loadLogs();
+  if (tab === "models") loadModels();
+  if (tab === "settings") loadConfig();
+  if (tab === "account") loadStatus();
+}));
+
+/* ---------- 总览 ---------- */
+function renderStatus(d) {
+  const c = d.credentials || {}, t = d.token || {};
+  $("#kPhone").textContent = t.phone || (c.hasSid && c.cookieCount > 5 ? "凭据已就绪" : "未连接");
+  $("#kSid").textContent = "sid " + (c.sidMasked || "—");
+  $("#kCookie").textContent = "cookie " + (c.cookieCount ?? 0) + " 项";
+  $("#kCookie").className = "badge " + (c.hasSid && c.cookieCount > 5 ? "ok" : "warn");
+  $("#kRmkey").textContent = "RMKEY " + (c.hasRmkey ? "✓" : "✗");
+  $("#kRmkey").className = "badge " + (c.hasRmkey ? "ok" : "err");
+
+  if (t.cached) {
+    $("#kExpiry").textContent = fmtLeft(t.remainingMs);
+    $("#kExpiryAt").textContent = "至 " + fmtTime(t.expiresAt);
+    $("#kTokenState").textContent = t.expired ? "已过期" : "有效";
+    $("#kTokenState").className = "badge " + (t.expired ? "err" : "ok");
+  } else {
+    $("#kExpiry").textContent = "未铸造";
+    $("#kExpiryAt").textContent = "调用对话时自动铸造";
+    $("#kTokenState").textContent = "未铸造";
+    $("#kTokenState").className = "badge mute";
+  }
+  $("#kTodayCalls").innerHTML = fmtN(d.today?.calls) + "<small>次</small>";
+  $("#kTodayTokens").textContent = fmtTok(d.today?.outputTokens) + " tokens";
+  $("#kTodayErr").textContent = fmtN(d.today?.errors) + " 失败";
+  $("#kUptime").textContent = fmtDur(d.server?.uptimeMs);
+  const port = d.server?.port || 8317;
+  $("#kBaseURL").textContent = "http://127.0.0.1:" + port + "/v1";
+  $("#kModelState").textContent = "模型 " + (d.server?.currentModelState || "—");
+
+  $("#footDot").className = "dot " + (c.hasSid && c.cookieCount > 5 ? "on" : "off");
+  $("#footState").textContent = c.hasSid && c.cookieCount > 5 ? "账号已连接" : "未连接账号";
+  $("#footPort").textContent = ":" + port;
+  $("#footVer").textContent = "v" + (d.version || "—");
+
+  $("#cfgBase").textContent = "http://127.0.0.1:" + port + "/v1";
+  $("#cfgChat").textContent = "http://127.0.0.1:" + port + "/v1/chat/completions";
+  $("#cfgModels").textContent = "http://127.0.0.1:" + port + "/v1/models";
+
+  $("#credDetail").innerHTML = [
+    ["sid", `<span class="mono">${esc(c.sidMasked || "—")}</span>`],
+    ["sid 长度", fmtN(c.sidLength)],
+    ["cookie 项数", fmtN(c.cookieCount)],
+    ["关键项", `${c.hasOsSsoSid ? '<span class="badge ok">Os_SSo_Sid ✓</span>' : '<span class="badge err">Os_SSo_Sid ✗</span>'} ${c.hasRmkey ? '<span class="badge ok">RMKEY ✓</span>' : '<span class="badge err">RMKEY ✗</span>'}`],
+    ["Token 手机号", esc(t.phone || "—")],
+    ["Token 剩余", t.cached ? fmtLeft(t.remainingMs) : "—"],
+    ["上次铸造", fmtTime(t.mintedAt)],
+    ["cookie 键名", `<span class="mono" style="font-size:11px">${esc((c.cookieNames || []).join(", "))}</span>`],
+  ].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
+
+  const ch = d.chrome;
+  const btn = $("#btnAuto");
+  if (ch) {
+    btn.disabled = false;
+    $("#chromeState").innerHTML = `✅ 检测到 ${esc(ch.browser)}（端口 ${ch.port}）`;
+  } else {
+    btn.disabled = true;
+    $("#chromeState").innerHTML = `⚠️ 未检测到调试端口（9222/9223/9224/9225/9333）。<br>可用 App 内「打开邮箱登录页」登录，或按指引以调试模式启动 Chrome。`;
+  }
+}
+
+async function loadStatus() {
+  try {
+    const d = await api("/status");
+    renderStatus(d);
+    renderOverview(d);
+  }
+  catch (e) { $("#footState").textContent = "面板令牌无效"; $("#footDot").className = "dot off"; toast("状态获取失败：" + e.message, "err"); }
+}
+
+/* 总览页的趋势图与模型分布（复用用量聚合） */
+async function renderOverview() {
+  try {
+    const u = await api("/usage?days=14");
+    const days = u.days.map((d) => { const b = u.byDay[d] || {}; return { date: d, v: b.calls || 0, tok: b.outputTokens || 0 }; });
+    if (days.some((d) => d.v > 0)) renderBars($("#miniBars"), days);
+    else $("#miniBars").innerHTML = '<div class="empty">暂无调用记录（发起对话后自动统计）</div>';
+    $("#miniModels").innerHTML = u.models?.length
+      ? u.models.slice(0, 8).map((m) => `<tr>
+          <td>${esc(m.name)}</td>
+          <td class="num">${fmtN(m.calls)}</td>
+          <td class="num">${fmtTok(m.outputTokens)}</td>
+          <td class="num">${m.calls ? ((m.ok / m.calls) * 100).toFixed(1) + "%" : "—"}</td></tr>`).join("")
+      : '<tr><td colspan="4" class="empty">暂无数据</td></tr>';
+  } catch { /* 忽略总览图表失败 */ }
+}
+
+/* ---------- 用量 ---------- */
+function renderBars(el, days, keys) {
+  if (!days?.length) { el.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  const max = Math.max(1, ...days.map((d) => d.v));
+  el.innerHTML = days.map((d, i) => {
+    const h = Math.max(3, Math.round((d.v / max) * 126));
+    const label = d.date.slice(5);
+    const step = days.length > 20 ? 3 : 2;
+    return `<div class="bar" title="${d.date}：${fmtN(d.v)} 次 / ${fmtTok(d.tok)} tok">
+      <div class="v">${d.v ? fmtN(d.v) : ""}</div>
+      <div class="stick" style="height:${h}px;${d.v ? "background:linear-gradient(180deg,#22d3ee,#3b82f6)" : "background:#243350"}"></div>
+      <div class="t">${i % step === 0 ? label : ""}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderUsage(u) {
+  const t = u.totals || {};
+  $("#uCalls").textContent = fmtN(t.calls);
+  $("#uCallsSub").textContent = `${fmtN(t.ok)} 成功 · ${fmtN(t.errors)} 失败`;
+  $("#uTokens").textContent = fmtTok(t.outputTokens);
+  $("#uTokensSub").textContent = `输出 ${fmtN(t.contentChars + t.reasoningChars)} 字（估算）`;
+  $("#uRate").textContent = t.calls ? ((t.ok / t.calls) * 100).toFixed(1) + "%" : "—";
+  $("#uRateSub").textContent = t.calls ? `${fmtN(t.errors)} 次失败` : "暂无调用";
+  $("#uLatency").textContent = t.calls ? fmtDur(t.elapsedMs / t.calls) : "—";
+  $("#uLatencySub").textContent = t.calls ? "端到端平均" : "—";
+
+  renderBars($("#usageBars"), u.days.map((d) => { const b = u.byDay[d] || {}; return { date: d, v: b.calls || 0, tok: b.outputTokens || 0 }; }));
+
+  $("#usageModels").innerHTML = u.models?.length
+    ? u.models.map((m) => `<tr>
+        <td>${esc(m.name)}<div class="mono" style="color:var(--dim);font-size:11px">${esc(m.model)}</div></td>
+        <td class="num">${fmtN(m.calls)}</td>
+        <td class="num"><span class="badge ok">${fmtN(m.ok)}</span> <span class="badge ${m.errors ? "err" : "mute"}">${fmtN(m.errors)}</span></td>
+        <td class="num">${fmtN(m.promptChars)}</td>
+        <td class="num">${fmtN(m.contentChars + m.reasoningChars)}</td>
+        <td class="num">${fmtTok(m.outputTokens)}</td>
+        <td class="num">${m.calls ? fmtDur(m.elapsedMs / m.calls) : "—"}</td></tr>`).join("")
+    : '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  $("#usageDays").innerHTML = u.days?.length
+    ? u.days.slice().reverse().map((d) => {
+        const b = u.byDay[d] || {};
+        return `<tr><td class="mono">${d}</td><td class="num">${fmtN(b.calls)}</td><td class="num">${fmtN(b.think)}</td><td class="num">${fmtN(b.search)}</td><td class="num">${fmtTok(b.outputTokens)}</td><td class="num">${b.errors ? '<span class="badge err">' + b.errors + "</span>" : "0"}</td></tr>`;
+      }).join("")
+    : '<tr><td colspan="6" class="empty">暂无数据</td></tr>';
+}
+
+async function loadUsage() {
+  try { renderUsage(await api("/usage?days=" + $("#selDays").value)); }
+  catch (e) { toast("统计加载失败：" + e.message, "err"); }
+}
+
+/* ---------- 日志 ---------- */
+async function loadLogs() {
+  try {
+    const { logs } = await api("/logs?limit=80");
+    $("#logRows").innerHTML = logs?.length
+      ? logs.map((l) => `<tr>
+          <td class="mono" style="color:var(--muted)">${fmtTime(l.ts)}</td>
+          <td>${esc(l.modelName)}</td>
+          <td>${l.think ? '<span class="badge info">思考</span>' : ""}${l.search ? '<span class="badge info">联网</span>' : ""}${l.toolCalls ? '<span class="badge info">工具×' + l.toolCalls + "</span>" : ""}</td>
+          <td class="num">${fmtN(l.promptChars)}</td>
+          <td class="num">${fmtN(l.contentChars + l.reasoningChars)}</td>
+          <td class="num">${fmtTok(l.outputTokens)}</td>
+          <td class="num">${fmtDur(l.elapsedMs)}</td>
+          <td>${l.ok ? '<span class="badge ok">成功</span>' : '<span class="badge err" title="' + esc(l.error) + '">失败</span> <span style="color:var(--dim);font-size:11px">' + esc((l.error || "").slice(0, 40)) + "</span>"}</td></tr>`).join("")
+      : '<tr><td colspan="8" class="empty">暂无调用记录</td></tr>';
+  } catch (e) { toast("日志加载失败：" + e.message, "err"); }
+}
+
+/* ---------- 模型 ---------- */
+async function loadModels() {
+  try {
+    const { models } = await api("/models");
+    $("#modelRows").innerHTML = models.map((m) => `<tr>
+      <td class="mono">${esc(m.id)}</td><td>${esc(m.name)}</td>
+      <td class="num">${fmtN(m.maxInput)}</td>
+      <td>${m.thinkable ? '<span class="badge ok">支持</span>' : '<span class="badge mute">不支持</span>'}</td>
+      <td class="num">${fmtN(m.usage?.calls)}</td>
+      <td class="num">${fmtTok(m.usage?.outputTokens)}</td>
+      <td class="num">${m.usage?.errors ? '<span class="badge err">' + m.usage.errors + "</span>" : "0"}</td></tr>`).join("");
+    const sel = $("#setModel");
+    if (!sel.options.length) sel.innerHTML = models.map((m) => `<option value="${esc(m.id)}">${esc(m.name)} (${esc(m.id)})</option>`).join("");
+  } catch (e) { toast("模型加载失败：" + e.message, "err"); }
+}
+
+/* ---------- 设置 ---------- */
+async function loadConfig() {
+  try {
+    const c = await api("/config");
+    $("#setPort").value = c.port || 8317;
+    $("#setApiKey").value = "";
+    $("#setApiKey").placeholder = c.apiKeySet ? c.apiKeyMasked + "（已设置，留空不修改）" : "sk-…";
+    if (c.defaultModel) $("#setModel").value = c.defaultModel;
+  } catch (e) { toast("设置加载失败：" + e.message, "err"); }
+}
+
+/* ---------- 动作 ---------- */
+async function withBusy(btn, fn) {
+  const html = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 处理中…';
+  try { return await fn(); } finally { btn.disabled = false; btn.innerHTML = html; }
+}
+
+$("#btnRefresh").onclick = () => withBusy($("#btnRefresh"), async () => {
+  await loadStatus(); await loadUsage(); toast("已刷新", "ok", 1600);
+});
+
+$("#btnRenewTop").onclick = () => withBusy($("#btnRenewTop"), async () => {
+  const r = await api("/renew", { method: "POST" });
+  if (r.ok) { toast("✅ Token 已重铸，有效期至 " + fmtTime(r.token?.expiresAt), "ok"); await loadStatus(); }
+  else toast("❌ 续期失败：" + esc(r.error) + "<br><span class='hint'>" + esc(r.hint || "") + "</span>", "err", 8000);
+});
+
+$("#btnRenew").onclick = () => withBusy($("#btnRenew"), async () => {
+  const r = await api("/renew", { method: "POST" });
+  if (r.ok) { toast("✅ Token 已重铸：" + fmtLeft(r.token?.remainingMs), "ok"); await loadStatus(); }
+  else toast("❌ 续期失败：" + esc(r.error), "err", 8000);
+});
+
+$("#btnProbe").onclick = () => withBusy($("#btnProbe"), async () => {
+  await loadStatus();
+  const d = await api("/status");
+  toast(d.chrome ? `✅ 检测到 ${esc(d.chrome.browser)}（端口 ${d.chrome.port}），可在「账号与续期」一键抓取` : "⚠️ 未检测到 Chrome 调试端口，请用粘贴导入", d.chrome ? "ok" : "warn", 6000);
+});
+
+$("#btnAuto").onclick = () => withBusy($("#btnAuto"), async () => {
+  const r = await api("/credentials/auto", { method: "POST", body: "{}" });
+  if (r.ok) { toast(`✅ 已从 ${esc(r.browser)} 抓取并保存（cookie ${r.cookieCount} 项，${esc(r.verified?.phone || "")}）`, "ok", 6000); await loadStatus(); }
+  else toast("❌ 抓取失败：" + esc(r.detail || r.reason), "err", 8000);
+});
+
+$("#btnAutoDry").onclick = () => withBusy($("#btnAutoDry"), async () => {
+  const r = await api("/credentials/auto", { method: "POST", body: JSON.stringify({ dryRun: true }) });
+  if (r.ok) toast(`✅ 试抓取成功：sid ${esc(r.sidMasked)}，cookie ${r.cookieCount} 项（未保存）`, "ok", 6000);
+  else toast("❌ 试抓取失败：" + esc(r.detail || r.reason), "err", 8000);
+});
+
+$("#btnOpenMail").onclick = async () => {
+  if (window.lingxiDesktop) {
+    const r = await window.lingxiDesktop.openLoginHelper();
+    if (r?.ok) toast(r.cached ? `✅ 已有可用登录态，凭据已自动抓取（${esc(r.phone || "")}）` : "已打开登录助手窗口，登录完成后凭据<strong>自动抓取并保存</strong>（本窗口会自动关闭）", "info", 8000);
+    else toast("❌ 登录助手启动失败：" + esc(r?.detail || r?.reason || ""), "err");
+    return;
+  }
+  const w = window.open("https://mail.10086.cn/", "_blank", "width=1100,height=760");
+  if (!w) toast("浏览器拦截了弹窗，请允许后重试", "warn");
+  else toast("已打开邮箱登录页；登录完成后回到本页点「抓取并保存」", "info", 7000);
+};
+
+$("#btnPaste").onclick = () => withBusy($("#btnPaste"), async () => {
+  let sid = $("#inSid").value.trim();
+  const cookie = $("#inCookie").value.trim();
+  if (!cookie) return toast("请粘贴 Cookie", "warn");
+  if (!sid) {
+    const m = cookie.match(/Os_SSo_Sid=([^;\s]+)/);
+    if (m) { sid = m[1]; toast("已从 cookie 的 Os_SSo_Sid 自动提取 sid", "info", 3200); }
+  }
+  if (!sid) return toast("缺少 sid（可留空由 Os_SSo_Sid 自动提取，但未找到）", "err");
+  const r = await api("/credentials", { method: "POST", body: JSON.stringify({ sid, cookie }) });
+  if (r.ok) { toast(`✅ 凭据已验证并保存（${esc(r.verified?.phone || "")}）`, "ok", 6000); $("#inSid").value = ""; $("#inCookie").value = ""; await loadStatus(); }
+  else toast("❌ " + esc(r.error), "err", 8000);
+});
+
+$("#btnSaveCfg").onclick = () => withBusy($("#btnSaveCfg"), async () => {
+  const body = { port: Number($("#setPort").value), defaultModel: $("#setModel").value };
+  const k = $("#setApiKey").value.trim();
+  if (k) body.apiKey = k;
+  const r = await api("/config", { method: "POST", body: JSON.stringify(body) });
+  toast("✅ 已保存" + (r.restartHint ? "（" + esc(r.restartHint) + "）" : ""), "ok", 5000);
+  await loadConfig();
+});
+
+$("#btnUsageRefresh").onclick = () => withBusy($("#btnUsageRefresh"), loadUsage);
+$("#btnLogsRefresh").onclick = () => withBusy($("#btnLogsRefresh"), loadLogs);
+$("#selDays").onchange = loadUsage;
+
+/* ---------- 初始化 ---------- */
+(async function init() {
+  // 桌面模式：切换为内置登录助手（体验最佳，无需 Chrome 调试端口）
+  if (window.lingxiDesktop) {
+    document.title = "灵犀网关 · 控制台（桌面版）";
+    $("#autoTitle").textContent = "方式一 · App 内置登录助手（推荐）";
+    $("#autoDesc").innerHTML = "在 App 内打开邮箱登录页，登录完成后<strong>自动读取 cookie</strong>（含 httpOnly 的 RMKEY / Os_SSo_Sid）并验证保存，全程无需手工导出。登录态持久化，日常续期无需重复登录。";
+    $("#autoSteps").innerHTML = `
+      <li>点击「打开登录助手」</li>
+      <li>在弹出窗口里完成邮箱登录</li>
+      <li>凭据自动抓取保存，窗口自动关闭</li>`;
+    $("#btnOpenMail").textContent = "打开登录助手";
+    $("#btnAuto").textContent = "从本机 Chrome 抓取";
+    window.lingxiDesktop.onCredentialsUpdated((d) => {
+      toast(`✅ 已自动获取并保存凭据<br><span class="hint">来源：${esc(d.source || "登录助手")} · ${esc(d.phone || "")} · cookie ${d.cookieCount || 0} 项</span>`, "ok", 8000);
+      loadStatus();
+    });
+    toast("桌面版已就绪：内嵌网关已启动", "ok", 4000);
+  }
+  await api("/token/ensure", { method: "POST" }).catch(() => {});
+  await loadStatus();
+  await loadUsage();
+  await loadModels();
+  setInterval(() => {
+    if ($("#s-overview").classList.contains("active")) loadStatus();
+  }, 15000);
+})();
+</script>
+</body>
+</html>

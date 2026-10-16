@@ -1,0 +1,83 @@
+{
+  "name": "lingxi-gateway",
+  "productName": "灵犀网关",
+  "version": "1.1.0",
+  "description": "139 邮箱 AI 工作台（灵犀/MClaw）→ OpenAI 兼容网关 · 桌面控制台（连接账号 / 续期 / 调用量统计）",
+  "author": "chaos-cl",
+  "license": "MIT",
+  "private": true,
+  "main": "desktop/main.js",
+  "scripts": {
+    "start": "electron .",
+    "serve": "node gateway/server.mjs",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:all": "electron-builder --mac --win",
+    "icon": "python3 build/make-icon.py"
+  },
+  "devDependencies": {
+    "electron": "^40.10.2",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.chaoscl.lingxi.gateway",
+    "productName": "灵犀网关",
+    "copyright": "Copyright © 2026 chaos-cl · MIT License",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "desktop/main.js",
+      "desktop/preload.js",
+      "gateway/**/*.mjs",
+      "gateway/web/**/*",
+      "gateway/README.md",
+      "package.json",
+      "!gateway/credentials.json",
+      "!gateway/credentials.json.bak",
+      "!gateway/config.json",
+      "!gateway/data/**",
+      "!**/*.log"
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] }
+      ],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
+      "identity": null,
+      "darkModeSupport": true
+    },
+    "dmg": {
+      "title": "灵犀网关 ${version}",
+      "contents": [
+        { "x": 140, "y": 200, "type": "file" },
+        { "x": 400, "y": 200, "type": "link", "path": "/Applications" }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "zip", "arch": ["x64"] }
+      ],
+      "artifactName": "${productName}-${version}-win-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "灵犀网关",
+      "artifactName": "${productName}-${version}-win-x64-setup.${ext}"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Development",
+      "target": ["AppImage"]
+    }
+  }
+}

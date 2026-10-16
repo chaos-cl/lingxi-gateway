@@ -1,0 +1,29 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/icon.iconset/
+
+# ★ 敏感：邮箱凭据（sid + cookie），绝不入库
+gateway/credentials.json
+gateway/credentials.json.bak
+gateway/credentials.json.*
+poc/credentials.json
+
+# ★ 敏感：运行时数据（用量记录、管理令牌）与本地配置
+gateway/config.json
+gateway/data/
+
+# ★ 敏感：网页端抓包样本（含真实 token/cookie）
+captures/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+
+# 临时文件
+*.tmp
+/tmp/
