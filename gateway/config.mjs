@@ -25,5 +25,9 @@ export function loadConfig(dir = DIR) {
     defaultModel: cfgFile.defaultModel || "blian_qwen38_flash",
     sid: process.env.MAIL_SID || cfgFile.sid || credFile.sid || "",
     cookie: process.env.MAIL_COOKIE || cfgFile.cookie || credFile.cookie || "",
+    // 缓存命中估算（上游不返回 usage，见 app.mjs 说明）；GATEWAY_CACHE_ESTIMATE=0 或 config.json {"cacheEstimate": false} 关闭
+    cacheEstimate: process.env.GATEWAY_CACHE_ESTIMATE
+      ? process.env.GATEWAY_CACHE_ESTIMATE !== "0"
+      : cfgFile.cacheEstimate !== false,
   };
 }

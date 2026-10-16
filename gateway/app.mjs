@@ -364,6 +364,46 @@ function lastUserText(messages) {
 
 const estTokens = (chars) => Math.ceil(chars * 0.6); // 粗略估算，仅用于 usage 展示
 
+/* ---------------- 缓存命中估算 ----------------
+ * 139 上游（ai.yun.139.com）的 SSE 事件里**没有任何 token/usage 字段**（实测：只有
+ * data.flowResult.{outContent,reasoningContent,finishReason,outAuditStatus…}、会话 id 与推荐
+ * 追问），139 网页版自身也从未调用任何用量/计费接口 —— 即平台没有把百炼（DashScope）的
+ * usage / 隐式上下文缓存计量透传给客户端。因此网关只能估算：
+ *   · token 数：按字符估（estTokens）
+ *   · 缓存命中：取「同一会话上一轮请求的最长公共前缀」，等价于百炼隐式上下文缓存的理论
+ *     命中量（对话逐轮追加时，前缀即上轮全部内容）
+ * 该值标记为非计量值：响应里 x_139.usage_source = "estimated"，便于客户端区分。
+ */
+const CACHE_PROMPTS = new Map(); // key → { prompt, at }
+const CACHE_TTL_MS = 30 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 64;
+
+function cacheConvKey(messages, modelId) {
+  const str = (v) => (typeof v === "string" ? v : JSON.stringify(v ?? ""));
+  const first = str(messages?.[0]?.content);
+  const second = str(messages?.[1]?.content).slice(0, 200);
+  return crypto.createHash("sha1").update(`${modelId}\u0000${first}\u0000${second}`).digest("hex").slice(0, 16);
+}
+
+function commonPrefixLen(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
+
+/** 估算本轮可命中缓存的字符数，并把本轮 prompt 记为下次比较基准 */
+function estimateCacheChars(key, prompt) {
+  const prev = CACHE_PROMPTS.get(key);
+  const hit = prev && Date.now() - prev.at < CACHE_TTL_MS ? commonPrefixLen(prev.prompt, prompt) : 0;
+  CACHE_PROMPTS.set(key, { prompt, at: Date.now() });
+  if (CACHE_PROMPTS.size > CACHE_MAX_ENTRIES) {
+    const oldest = CACHE_PROMPTS.keys().next().value;
+    if (oldest !== undefined) CACHE_PROMPTS.delete(oldest);
+  }
+  return hit;
+}
+
 function oaiError(res, status, message, type = "invalid_request_error", code = null) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify({ error: { message, type, code } }));
@@ -419,6 +459,11 @@ async function handleChat(req, res, body, deps) {
     return oaiError(res, e.status || 400, e.message);
   }
 
+  // 缓存命中估算（前缀复用）：必须在本轮调用前算，并把本轮 prompt 记为下轮基准
+  const cacheTokens = config.cacheEstimate === false
+    ? 0
+    : estTokens(estimateCacheChars(cacheConvKey(messages, modelObj.id), dialogue));
+
   // 客户端断开 → 中止上游。
   // 超时策略：空闲超时（上游 3 分钟无新数据视为卡死）+ 30 分钟总时长硬上限。
   // 不用固定总超时——长思考流（30k+ 字 reasoning）总时长常超 5 分钟但数据持续到达，属正常流。
@@ -449,8 +494,34 @@ async function handleChat(req, res, body, deps) {
   const id = "chatcmpl-139-" + crypto.randomUUID().slice(0, 8);
   const created = Math.floor(Date.now() / 1000);
   const promptChars = dialogue.length;
+  // usage 块（所有返回路径共用）：带缓存字段，供客户端统计命中率
+  const usageBlock = () => {
+    const promptTokens = estTokens(promptChars);
+    const completionTokens = estTokens(content.length + reasoning.length);
+    return {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+      // 缓存命中（估算值）：OpenBitFun 优先读 DeepSeek 扩展，其次读标准字段
+      prompt_tokens_details: { cached_tokens: cacheTokens },
+      prompt_cache_hit_tokens: cacheTokens,
+      prompt_cache_miss_tokens: Math.max(0, promptTokens - cacheTokens),
+    };
+  };
+  const usageSource = cacheTokens > 0 ? "estimated" : "estimated_no_prefix_reuse";
   let content = "", reasoning = "", modelUsed = "", sidOut = "", statement = "", citations = [];
   let toolCallCount = 0;
+  // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
+  const finalize = () => {
+    log(`[chat] ${modelObj.name}${think ? "+think" : ""}${webSearch ? "+search" : ""}${toolCallCount ? "+tools(" + toolCallCount + ")" : ""} | ${sessionId ? "续会话" : "新会话"} ${sidOut || ""} | ${content.length}字${cacheTokens ? " 缓存≈" + cacheTokens + "tok" : ""} ${Date.now() - t0}ms`);
+    recordUsage({
+      model: modelObj.id, modelName: modelObj.name, think: !!think, search: !!webSearch,
+      ok: true, promptChars, contentChars: content.length, reasoningChars: reasoning.length,
+      promptTokens: estTokens(promptChars), completionTokens: estTokens(content.length + reasoning.length),
+      cacheTokens,
+      elapsedMs: Date.now() - t0, toolCalls: toolCallCount,
+    });
+  };
   const baseChunk = (delta, extra = {}) => ({
     id, object: "chat.completion.chunk", created, model: modelObj.id, choices: [{ index: 0, delta, finish_reason: null, ...extra }],
   });
@@ -484,9 +555,10 @@ async function handleChat(req, res, body, deps) {
           },
           finish_reason: toolCallsOut.length ? "tool_calls" : "stop",
         }],
-        usage: { prompt_tokens: estTokens(promptChars), completion_tokens: estTokens(content.length + reasoning.length), total_tokens: estTokens(promptChars + content.length + reasoning.length) },
-        x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, elapsed_ms: Date.now() - t0 },
+        usage: usageBlock(),
+        x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, elapsed_ms: Date.now() - t0, usage_source: usageSource, cache_estimate_tokens: cacheTokens },
       }));
+      finalize();
       return;
     }
 
@@ -537,14 +609,14 @@ async function handleChat(req, res, body, deps) {
     res.write(`data: ${JSON.stringify({
       ...baseChunk({}),
       choices: [{ index: 0, delta: {}, finish_reason: sawToolCall ? "tool_calls" : "stop" }],
-      x_139: { session_id: sidOut, model_used: modelUsed, statement, citations },
+      x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, usage_source: usageSource, cache_estimate_tokens: cacheTokens },
     })}\n\n`);
     // usage chunk：无条件发送（OpenBitFun 等客户端不带 stream_options.include_usage，
     // 但其 token 用量/TPS 显示依赖流内 usage 块；choices:[] 的 usage 帧是 OpenAI 官方 include_usage 语义，多余无害）
     res.write(`data: ${JSON.stringify({
       id, object: "chat.completion.chunk", created, model: modelObj.id,
       choices: [],
-      usage: { prompt_tokens: estTokens(promptChars), completion_tokens: estTokens(content.length + reasoning.length), total_tokens: estTokens(promptChars + content.length + reasoning.length) },
+      usage: usageBlock(),
     })}\n\n`);
     res.write("data: [DONE]\n\n");
     res.end();
@@ -565,18 +637,15 @@ async function handleChat(req, res, body, deps) {
       model: modelObj.id, modelName: modelObj.name, think: !!think, search: !!webSearch,
       ok: false, error: String(message).slice(0, 200),
       promptChars: dialogue?.length || 0, contentChars: content.length, reasoningChars: reasoning.length,
+      promptTokens: estTokens(dialogue?.length || 0), completionTokens: estTokens(content.length + reasoning.length),
+      cacheTokens,
       elapsedMs: Date.now() - t0, toolCalls: 0,
     });
     log(`[chat] 失败: ${message}`);
     return;
   }
 
-  log(`[chat] ${modelObj.name}${think ? "+think" : ""}${webSearch ? "+search" : ""}${toolCallCount ? "+tools(" + toolCallCount + ")" : ""} | ${sessionId ? "续会话" : "新会话"} ${sidOut || ""} | ${content.length}字 ${Date.now() - t0}ms`);
-  recordUsage({
-    model: modelObj.id, modelName: modelObj.name, think: !!think, search: !!webSearch,
-    ok: true, promptChars, contentChars: content.length, reasoningChars: reasoning.length,
-    elapsedMs: Date.now() - t0, toolCalls: toolCallCount,
-  });
+  finalize();
 
   function collect(ev) {
     const d = ev.data || {};

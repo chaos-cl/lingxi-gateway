@@ -25,7 +25,7 @@ OpenBitFun / OpenAI SDK / Claude Code / Cherry Studio …
 | 🔌 **OpenAI 全兼容** | `/v1/models`、`/v1/chat/completions`（流式 / 非流式），任意支持自定义 Base URL 的客户端直接接入 |
 | 🧠 **深度思考** | 自动归一化 `enable_thinking` / `thinking:{type}` / `reasoning_effort` 三种客户端风格，思考流映射为 `delta.reasoning_content` |
 | 🛠 **工具调用（function calling）** | 139 上游无原生支持 → 网关以 qwen HERMES 文本协议模拟，含流式状态机（跨 chunk 标签、未转义引号抢救、多余闭合标签剥离），Agent 场景可直接跑 |
-| 📊 **TPS / 用量上报** | 流式响应无条件携带 `usage` 块，客户端（如 OpenBitFun）可直接显示 token 用量与输出速度 |
+| 📊 **TPS / 用量上报** | 流式响应无条件携带 `usage` 块，客户端（如 OpenBitFun）可直接显示 token 用量、输出速度与**缓存命中率**（上游不提供计量，网关按前缀复用估算并标记来源） |
 | 👤 **账号连接** | 桌面版内置登录助手：App 内登录 139 邮箱 → 自动读取 httpOnly cookie → 验证铸造 → 保存，**无需手工导出凭据** |
 | ♻️ **自动续期** | Token 约 25 天有效，到期前 1 天自动重铸；支持一键手动续期与会话过期提醒 |
 | 📈 **调用统计** | 按模型 × 按天的调用量、输入/输出字数、估算 tokens、平均耗时、成功率；近 7/14/30/90 天趋势 |
@@ -271,6 +271,18 @@ Get-NetTCPConnection -LocalPort 8317 | Select-Object OwningProcess
 <summary><b>思考过程不显示 / TPS 不显示</b></summary>
 
 思考需要所选模型支持（见模型表）且客户端正确解析 `delta.reasoning_content`；TPS 依赖流内 `usage` 块，网关已无条件发送，若客户端仍不显示请检查其是否基于 `usage.completion_tokens` 计算。
+</details>
+
+<details>
+<summary><b>缓存命中率是怎么算的？上游（百炼）不是会返回吗？</b></summary>
+
+实测**上游不返回任何计量数据**：139 上游 SSE 事件里没有 `usage` 字段（只有 `flowResult.outContent` 等文本字段），139 网页版自身也从未调用任何用量/计费接口 —— 平台没有把百炼的 usage 与隐式上下文缓存透传给客户端。
+
+因此网关按**前缀复用**估算缓存命中：取「与同一会话上一轮请求的最长公共前缀」。对话逐轮追加时，上一轮发送的内容就是本轮 prompt 的前缀，而百炼等平台的上下文缓存正是按最长匹配前缀计费的 —— 前缀命中多少即缓存省下多少。
+
+响应同时给出 `prompt_cache_hit_tokens`（DeepSeek 扩展，OpenBitFun 优先读）与 `prompt_tokens_details.cached_tokens`（OpenAI 标准），并用 `x_139.usage_source = "estimated"` 标记为估算值；控制台「调用统计」页的命中率分母只统计上报过缓存字段的调用。
+
+关闭：环境变量 `GATEWAY_CACHE_ESTIMATE=0`，或 `config.json` 中 `{"cacheEstimate": false}`。
 </details>
 
 <details>

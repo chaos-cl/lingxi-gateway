@@ -74,10 +74,10 @@ export function aggregate({ days = 14 } = {}) {
   const rows = readUsage({ sinceMs: since });
 
   const byDay = {};
-  for (const d of dayList) byDay[d] = { date: d, calls: 0, ok: 0, errors: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, elapsedMs: 0, models: {} };
+  for (const d of dayList) byDay[d] = { date: d, calls: 0, ok: 0, errors: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, models: {} };
   const byModel = {};
   const modelNames = {};
-  const totals = { calls: 0, ok: 0, errors: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, elapsedMs: 0, firstTs: null, lastTs: null, todayCalls: 0, todayTokens: 0 };
+  const totals = { calls: 0, ok: 0, errors: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, firstTs: null, lastTs: null, todayCalls: 0, todayTokens: 0 };
   const today = dayKey(Date.now());
 
   for (const r of rows) {
@@ -87,6 +87,11 @@ export function aggregate({ days = 14 } = {}) {
     const ok = r.ok !== false;
     const outChars = (r.contentChars || 0) + (r.reasoningChars || 0);
     const outTok = estTokens(outChars);
+    // 旧记录没有 promptTokens/cacheTokens 字段 → 回退为按字符估算 / 0
+    const pTok = r.promptTokens ?? estTokens(r.promptChars || 0);
+    const cTok = r.cacheTokens || 0;
+    // 只有上报过缓存字段的调用才计入命中率分母（旧记录/未启用估算时不污染统计）
+    const cMeasured = r.cacheTokens == null ? 0 : pTok;
 
     bucket.calls++; ok ? bucket.ok++ : bucket.errors++;
     if (r.think) bucket.think++;
@@ -95,11 +100,15 @@ export function aggregate({ days = 14 } = {}) {
     bucket.contentChars += r.contentChars || 0;
     bucket.reasoningChars += r.reasoningChars || 0;
     bucket.outputTokens += outTok;
+    bucket.promptTokens += pTok;
+    bucket.cacheTokens += cTok;
+    bucket.cachePromptTokens += cMeasured;
     bucket.elapsedMs += r.elapsedMs || 0;
-    const m = (bucket.models[r.model] ||= { calls: 0, errors: 0, outputTokens: 0, elapsedMs: 0 });
+    const m = (bucket.models[r.model] ||= { calls: 0, errors: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0 });
     m.calls++; if (!ok) m.errors++; m.outputTokens += outTok; m.elapsedMs += r.elapsedMs || 0;
+    m.promptTokens += pTok; m.cacheTokens += cTok; m.cachePromptTokens += cMeasured;
 
-    const mm = (byModel[r.model] ||= { model: r.model, name: r.modelName || r.model, calls: 0, ok: 0, errors: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, elapsedMs: 0, lastTs: 0 });
+    const mm = (byModel[r.model] ||= { model: r.model, name: r.modelName || r.model, calls: 0, ok: 0, errors: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, lastTs: 0 });
     mm.calls++; ok ? mm.ok++ : mm.errors++;
     if (r.think) mm.think++;
     if (r.search) mm.search++;
@@ -107,6 +116,9 @@ export function aggregate({ days = 14 } = {}) {
     mm.contentChars += r.contentChars || 0;
     mm.reasoningChars += r.reasoningChars || 0;
     mm.outputTokens += outTok;
+    mm.promptTokens += pTok;
+    mm.cacheTokens += cTok;
+    mm.cachePromptTokens += cMeasured;
     mm.elapsedMs += r.elapsedMs || 0;
     mm.lastTs = Math.max(mm.lastTs, r.ts);
 
@@ -115,12 +127,22 @@ export function aggregate({ days = 14 } = {}) {
     totals.contentChars += r.contentChars || 0;
     totals.reasoningChars += r.reasoningChars || 0;
     totals.outputTokens += outTok;
+    totals.promptTokens += pTok;
+    totals.cacheTokens += cTok;
+    totals.cachePromptTokens += cMeasured;
     totals.elapsedMs += r.elapsedMs || 0;
     totals.firstTs = totals.firstTs === null ? r.ts : Math.min(totals.firstTs, r.ts);
     totals.lastTs = totals.lastTs === null ? r.ts : Math.max(totals.lastTs, r.ts);
     if (d === today) { totals.todayCalls++; totals.todayTokens += outTok; }
     modelNames[r.model] = r.modelName || r.model;
   }
+
+  // 缓存命中率（估算值，命中量来自前缀复用估算；见 app.mjs 缓存估算说明）
+  // 分母 cachePromptTokens 只含上报了缓存字段的调用
+  const withRate = (o) => { o.cacheHitRate = o.cachePromptTokens > 0 ? o.cacheTokens / o.cachePromptTokens : null; return o; };
+  withRate(totals);
+  Object.values(byDay).forEach((b) => { withRate(b); Object.values(b.models).forEach(withRate); });
+  Object.values(byModel).forEach(withRate);
 
   return {
     generatedAt: Date.now(),
@@ -147,6 +169,10 @@ export function recentLogs({ limit = 60 } = {}) {
     contentChars: r.contentChars || 0,
     reasoningChars: r.reasoningChars || 0,
     outputTokens: estTokens((r.contentChars || 0) + (r.reasoningChars || 0)),
+    promptTokens: r.promptTokens ?? estTokens(r.promptChars || 0),
+    cacheTokens: r.cacheTokens || 0,
+    cachePromptTokens: r.cacheTokens == null ? 0 : (r.promptTokens ?? estTokens(r.promptChars || 0)),
+    cacheHitRate: r.cacheTokens == null ? null : ((r.cacheTokens || 0) / Math.max(1, r.promptTokens ?? estTokens(r.promptChars || 0))),
     elapsedMs: r.elapsedMs || 0,
     toolCalls: r.toolCalls || 0,
   }));

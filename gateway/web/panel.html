@@ -44,8 +44,8 @@
   .btn.ghost{background:transparent}
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .grid{display:grid;gap:14px}
-  .cols-4{grid-template-columns:repeat(4,1fr)} .cols-3{grid-template-columns:repeat(3,1fr)} .cols-2{grid-template-columns:repeat(2,1fr)}
-  @media(max-width:1080px){.cols-4{grid-template-columns:repeat(2,1fr)}.cols-3,.cols-2{grid-template-columns:1fr}.shell{grid-template-columns:64px 1fr}aside .brand b,aside .brand small,nav a span.lbl,.side-foot{display:none}}
+  .cols-4{grid-template-columns:repeat(4,1fr)} .cols-3{grid-template-columns:repeat(3,1fr)} .cols-2{grid-template-columns:repeat(2,1fr)} .cols-5{grid-template-columns:repeat(5,1fr)}
+  @media(max-width:1080px){.cols-4,.cols-5{grid-template-columns:repeat(2,1fr)}.cols-3,.cols-2{grid-template-columns:1fr}.shell{grid-template-columns:64px 1fr}aside .brand b,aside .brand small,nav a span.lbl,.side-foot{display:none}}
   .card{background:linear-gradient(180deg,var(--card),#131c31);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
   .card h3{margin:0 0 12px;font-size:13px;color:var(--muted);font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;gap:8px}
   .kpi{font-size:26px;font-weight:750;letter-spacing:-.5px}
@@ -226,9 +226,10 @@
           <button class="btn" id="btnUsageRefresh">刷新</button>
         </div>
       </header>
-      <div class="grid cols-4" style="margin-bottom:14px">
+      <div class="grid cols-5" style="margin-bottom:14px">
         <div class="card"><h3>总调用</h3><div class="kpi" id="uCalls">0</div><div class="sub" id="uCallsSub">—</div></div>
         <div class="card"><h3>输出 tokens</h3><div class="kpi" id="uTokens">0</div><div class="sub" id="uTokensSub">—</div></div>
+        <div class="card"><h3>缓存命中 <span style="font-size:11px;color:var(--dim)">估算</span></h3><div class="kpi" id="uCache">—</div><div class="sub" id="uCacheSub">—</div></div>
         <div class="card"><h3>成功率</h3><div class="kpi" id="uRate">—</div><div class="sub" id="uRateSub">—</div></div>
         <div class="card"><h3>平均耗时</h3><div class="kpi" id="uLatency">—</div><div class="sub" id="uLatencySub">—</div></div>
       </div>
@@ -240,8 +241,8 @@
       <div class="grid cols-2">
         <div class="card">
           <h3>按模型</h3>
-          <table><thead><tr><th>模型</th><th class="num">调用</th><th class="num">成功/失败</th><th class="num">输入字</th><th class="num">输出字</th><th class="num">tokens</th><th class="num">平均耗时</th></tr></thead>
-          <tbody id="usageModels"><tr><td colspan="7" class="empty">暂无数据</td></tr></tbody></table>
+          <table><thead><tr><th>模型</th><th class="num">调用</th><th class="num">成功/失败</th><th class="num">输入字</th><th class="num">输出字</th><th class="num">tokens</th><th class="num">缓存命中</th><th class="num">平均耗时</th></tr></thead>
+          <tbody id="usageModels"><tr><td colspan="8" class="empty">暂无数据</td></tr></tbody></table>
         </div>
         <div class="card">
           <h3>按天明细</h3>
@@ -331,17 +332,21 @@ function toast(msg, kind = "info", ms = 4200) {
   setTimeout(() => { el.style.opacity = "0"; el.style.transition = ".3s"; setTimeout(() => el.remove(), 320); }, ms);
 }
 
-/* ---------- 标签切换 ---------- */
-document.querySelectorAll("nav a").forEach((a) => a.addEventListener("click", () => {
-  document.querySelectorAll("nav a").forEach((x) => x.classList.toggle("active", x === a));
-  const tab = a.dataset.tab;
+/* ---------- 标签切换（支持 #usage 之类的深链） ---------- */
+function setTab(tab, updateHash = true) {
+  const target = document.querySelector(`nav a[data-tab="${tab}"]`);
+  if (!target) return;
+  document.querySelectorAll("nav a").forEach((x) => x.classList.toggle("active", x === target));
   document.querySelectorAll(".sect").forEach((s) => s.classList.toggle("active", s.id === "s-" + tab));
+  if (updateHash && location.hash !== "#" + tab) history.replaceState(null, "", "#" + tab);
   if (tab === "usage") loadUsage();
   if (tab === "logs") loadLogs();
   if (tab === "models") loadModels();
   if (tab === "settings") loadConfig();
   if (tab === "account") loadStatus();
-}));
+}
+document.querySelectorAll("nav a").forEach((a) => a.addEventListener("click", () => setTab(a.dataset.tab)));
+window.addEventListener("hashchange", () => setTab((location.hash || "").slice(1) || "overview", false));
 
 /* ---------- 总览 ---------- */
 function renderStatus(d) {
@@ -455,6 +460,9 @@ function renderUsage(u) {
   $("#uRateSub").textContent = t.calls ? `${fmtN(t.errors)} 次失败` : "暂无调用";
   $("#uLatency").textContent = t.calls ? fmtDur(t.elapsedMs / t.calls) : "—";
   $("#uLatencySub").textContent = t.calls ? "端到端平均" : "—";
+  // 缓存命中（估算）：上游不返回 usage，命中量按前缀复用估算（见 README）
+  $("#uCache").textContent = t.cacheHitRate == null ? "—" : (t.cacheHitRate * 100).toFixed(1) + "%";
+  $("#uCacheSub").textContent = t.cachePromptTokens ? `${fmtTok(t.cacheTokens)} / ${fmtTok(t.cachePromptTokens)} 前缀复用` : "暂无上报";
 
   renderBars($("#usageBars"), u.days.map((d) => { const b = u.byDay[d] || {}; return { date: d, v: b.calls || 0, tok: b.outputTokens || 0 }; }));
 
@@ -466,8 +474,9 @@ function renderUsage(u) {
         <td class="num">${fmtN(m.promptChars)}</td>
         <td class="num">${fmtN(m.contentChars + m.reasoningChars)}</td>
         <td class="num">${fmtTok(m.outputTokens)}</td>
+        <td class="num">${m.cacheHitRate == null ? "—" : (m.cacheHitRate * 100).toFixed(0) + "%"}</td>
         <td class="num">${m.calls ? fmtDur(m.elapsedMs / m.calls) : "—"}</td></tr>`).join("")
-    : '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    : '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   $("#usageDays").innerHTML = u.days?.length
     ? u.days.slice().reverse().map((d) => {
@@ -631,6 +640,9 @@ $("#selDays").onchange = loadUsage;
   await loadStatus();
   await loadUsage();
   await loadModels();
+  // 深链：#usage / #logs / #models / #account / #settings 直接定位标签页
+  const hashTab = (location.hash || "").slice(1);
+  if (hashTab && document.querySelector(`nav a[data-tab="${hashTab}"]`) && hashTab !== "overview") setTab(hashTab, false);
   setInterval(() => {
     if ($("#s-overview").classList.contains("active")) loadStatus();
   }, 15000);

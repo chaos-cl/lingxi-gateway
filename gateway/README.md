@@ -142,9 +142,33 @@ sid+cookie ──POST queryUserToken──▶ RCS token(≈25天) ──▶ Basi
 
 1. **非官方接口**：协议来自网页端逆向，可能随服务端变更失效；请勿高并发滥用，有风控/封号风险
 2. **模型是账号级全局状态**：网关内部已对"切模型→对话首包"加互斥锁保证并发正确；但切模型会同步影响你自己网页端 AI工作台的默认模型
-3. `temperature`/`top_p` 等采样参数上游不暴露，会被忽略；`usage` 为按字符估算值
+3. `temperature`/`top_p` 等采样参数上游不暴露，会被忽略
 4. 内容经平台审核记录（`outAuditStatus`），勿传敏感数据
 5. `credentials.json` 含登录凭据，注意文件权限，勿提交/外传
+
+## token 用量与缓存命中（估算）
+
+**上游不提供任何计量数据**：139 上游的 SSE 事件里没有 `usage` 字段（实测事件只含
+`data.flowResult.{outContent,reasoningContent,finishReason,outAuditStatus…}`、会话 id 与推荐追问），
+139 网页版自身也从未调用任何用量/计费接口 —— 即平台没有把百炼（DashScope）的 usage 与隐式上下文
+缓存计量透传给客户端。因此网关只能估算：
+
+| 指标 | 估算方式 | 落盘字段 |
+|---|---|---|
+| `prompt_tokens` / `completion_tokens` | 字符数 × 0.6 | `promptTokens` / `completionTokens` |
+| 缓存命中 `cached_tokens` | **前缀复用**：与同一会话上一轮请求的最长公共前缀 | `cacheTokens` |
+
+**为什么前缀复用等价于缓存命中**：对话逐轮追加时，上一轮发送的全部内容就是本轮 prompt 的前缀，
+而百炼/主流服务商的上下文缓存正是按「最长匹配前缀」计费的 —— 该前缀命中多少，就是缓存省下多少。
+
+- 响应中同时给出 `usage.prompt_cache_hit_tokens`（DeepSeek 扩展，OpenBitFun 优先读取）、
+  `usage.prompt_tokens_details.cached_tokens`（OpenAI 标准）与 `prompt_cache_miss_tokens`
+- 并标记 `x_139.usage_source = "estimated"` + `x_139.cache_estimate_tokens`，便于客户端区分「计量值 / 估算值」
+- 统计页的命中率分母只包含**上报过缓存字段**的调用，历史记录不会稀释命中率
+- 关闭估算：环境变量 `GATEWAY_CACHE_ESTIMATE=0`，或 `config.json` 写 `{"cacheEstimate": false}`
+  （关闭后仍会发送 `cached_tokens: 0`，客户端通常显示为「未上报缓存」）
+
+> 该数值用于观察趋势与成本结构，**不等于**运营商账单口径的缓存命中量。
 
 ## 文件结构
 
