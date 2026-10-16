@@ -1,7 +1,7 @@
 {
   "name": "lingxi-gateway",
   "productName": "灵犀网关",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "139 邮箱 AI 工作台（灵犀/MClaw）→ OpenAI 兼容网关 · 桌面控制台（连接账号 / 续期 / 调用量统计）",
   "author": "chaos-cl",
   "license": "MIT",
@@ -47,7 +47,10 @@
         { "target": "dmg", "arch": ["arm64", "x64"] }
       ],
       "artifactName": "LingxiGateway-${version}-mac-${arch}.${ext}",
-      "identity": null,
+      "identity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
       "darkModeSupport": true
     },
     "dmg": {

@@ -28,6 +28,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { loadConfig, GATEWAY_DIR } from "./config.mjs";
 import { TokenManager } from "./token.mjs";
@@ -36,7 +37,16 @@ import { MODELS, resolveModel, openaiModels } from "./models.mjs";
 import { recordUsage, setUsageDir } from "./usage.mjs";
 import { createAdminApi } from "./admin.mjs";
 
-export const GATEWAY_VERSION = "1.1.0";
+/** 版本号单一来源：package.json（打包进 asar 后位于 ../package.json，同样可读） */
+function readOwnVersion() {
+  try {
+    return createRequire(import.meta.url)("../package.json").version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+export const GATEWAY_VERSION = readOwnVersion();
 
 /* ---------------- 凭据 / 配置文件读写 ---------------- */
 

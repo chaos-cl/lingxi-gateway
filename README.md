@@ -58,9 +58,11 @@ OpenBitFun / OpenAI SDK / Claude Code / Cherry Studio …
 | Windows（x64） | `LingxiGateway-<版本>-win-x64-setup.exe` | 安装向导，可选安装目录 |
 | Windows（便携） | `LingxiGateway-<版本>-win-x64.zip` | 解压双击 `LingxiGateway.exe`，免安装 |
 
-> **macOS 首次打开提示「已损坏」或「无法验证开发者」？** 本项目未做 Apple 代码签名，属正常现象。任选其一：
-> - 右键点击 App → **打开** → 弹窗里再点「打开」；
-> - 或终端执行：`xattr -dr com.apple.quarantine /Applications/灵犀网关.app`
+> **macOS 首次打开提示「已损坏」或「无法验证开发者」？** 这是 Gatekeeper 对**未经 Apple 公证**应用的通用提示（不代表文件真的损坏，产物本身是有效的 ad-hoc 签名）。任选其一解除：
+> - **推荐**终端执行：`xattr -dr com.apple.quarantine /Applications/灵犀网关.app`
+> - 或右键点击 App → **打开** → 弹窗里再点「打开」
+>
+> 解除后即可长期正常启动（应用签名有效，无需重复操作）。
 >
 > **Windows SmartScreen 提示？** 点击「更多信息」→「仍要运行」。
 
@@ -304,6 +306,27 @@ export ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/   # 加速 Electr
 ```
 
 **CI 构建**：推送 `v*` 标签触发 GitHub Actions 三平台矩阵构建（macOS arm64 / macOS x64 / Windows x64），自动创建 Release 并上传安装包，见 [`.github/workflows/release.yml`](.github/workflows/release.yml)。
+
+### 代码签名与公证
+
+macOS 产物使用 **ad-hoc 签名**（`mac.identity: "-"`，配套 [build/entitlements.mac.plist](build/entitlements.mac.plist) 的 JIT / 库校验豁免条目），即**签名有效、应用可正常启动，但未经 Apple 公证**，因此首次打开仍需上面的 Gatekeeper 解除步骤。
+
+要彻底消除该提示（用户双击即可打开），需要 **Apple Developer Program（99 美元/年）** 签发的 `Developer ID Application` 证书 —— 注意 `Apple Development` 证书**不能**用于分发与公证。拿到证书后：
+
+```bash
+# electron-builder 会自动读取证书与公证凭据
+export CSC_LINK=/path/to/developer-id.p12 CSC_KEY_PASSWORD=xxxx
+export APPLE_ID=you@example.com
+export APPLE_APP_SPECIFIC_PASSWORD=xxxx        # App 专用密码
+export APPLE_TEAM_ID=XXXXXXXXXX
+npx electron-builder --mac                      # 签名 → 公证 → 装订（stapler）
+
+# 如需手动公证已构建的 dmg
+xcrun notarytool submit LingxiGateway-<版本>-mac-arm64.dmg --keychain-profile AC --wait
+xcrun stapler staple LingxiGateway-<版本>-mac-arm64.dmg
+```
+
+CI 场景把上述变量放进仓库 Secrets，并在 `build.mac` 中加上 `"notarize": true` 即可（Windows 侧对应 `CSC_LINK` 代码签名证书，可消除 SmartScreen 提示）。
 
 ### 项目结构
 
