@@ -27,3 +27,5 @@ Thumbs.db
 # 临时文件
 *.tmp
 /tmp/
+.openbitfun/
+/.openbitfun/search/flashgrep-index/

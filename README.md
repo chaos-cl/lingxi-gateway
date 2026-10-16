@@ -49,14 +49,14 @@ OpenBitFun / OpenAI SDK / Claude Code / Cherry Studio …
 
 ### 方式一：下载安装包（推荐普通用户）
 
-从 [Releases](../../releases) 下载对应平台：
+从 [Releases](../../releases) 下载对应平台（安装后应用名为「灵犀网关」）：
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| macOS（Apple Silicon / M 系列） | `灵犀网关-<版本>-mac-arm64.dmg` | 打开 dmg 拖入「应用程序」 |
-| macOS（Intel） | `灵犀网关-<版本>-mac-x64.dmg` | 同上 |
-| Windows（x64） | `灵犀网关-<版本>-win-x64-setup.exe` | 安装向导，可选安装目录 |
-| Windows（便携） | `灵犀网关-<版本>-win-x64.zip` | 解压双击 `灵犀网关.exe`，免安装 |
+| macOS（Apple Silicon / M 系列） | `LingxiGateway-<版本>-mac-arm64.dmg` | 打开 dmg 拖入「应用程序」 |
+| macOS（Intel） | `LingxiGateway-<版本>-mac-x64.dmg` | 同上 |
+| Windows（x64） | `LingxiGateway-<版本>-win-x64-setup.exe` | 安装向导，可选安装目录 |
+| Windows（便携） | `LingxiGateway-<版本>-win-x64.zip` | 解压双击 `灵犀网关.exe`，免安装 |
 
 > **macOS 首次打开提示「已损坏」或「无法验证开发者」？** 本项目未做 Apple 代码签名，属正常现象。任选其一：
 > - 右键点击 App → **打开** → 弹窗里再点「打开」；

@@ -92,5 +92,6 @@ jobs:
           draft: false
           generate_release_notes: true
           files: |
-            artifacts/macos-packages/*
-            artifacts/windows-packages/*
+            artifacts/macos-packages/*.dmg
+            artifacts/windows-packages/*.exe
+            artifacts/windows-packages/*.zip
