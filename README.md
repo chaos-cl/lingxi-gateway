@@ -276,13 +276,18 @@ Get-NetTCPConnection -LocalPort 8317 | Select-Object OwningProcess
 <details>
 <summary><b>缓存命中率是怎么算的？上游（百炼）不是会返回吗？</b></summary>
 
-实测**上游不返回任何计量数据**：139 上游 SSE 事件里没有 `usage` 字段（只有 `flowResult.outContent` 等文本字段），139 网页版自身也从未调用任何用量/计费接口 —— 平台没有把百炼的 usage 与隐式上下文缓存透传给客户端。
+**开关在调用方那一跳，不在我们这里。** 查证结果：
 
-因此网关按**前缀复用**估算缓存命中：取「与同一会话上一轮请求的最长公共前缀」。对话逐轮追加时，上一轮发送的内容就是本轮 prompt 的前缀，而百炼等平台的上下文缓存正是按最长匹配前缀计费的 —— 前缀命中多少即缓存省下多少。
+1. 百炼 OpenAI 兼容接口的流式计量需要调用方设置 `stream_options.include_usage = true`（**默认 false**），否则最后一个数据块不含 `usage` —— 这是百炼侧的开关，调用方是 139 平台，不是本网关；
+2. 139 平台的客户端 API（`/chat/v2/add`）请求体与网页版官方客户端**逐字段一致**（从 4.7MB 前端包中提取比对），**没有请求计量的参数**；36 个前端 chunk 全量扫描零命中 `include_usage`/`stream_options`/`prompt_tokens`/`cached_tokens`/`cache_control`，网页版自身也不显示任何用量信息。
 
-响应同时给出 `prompt_cache_hit_tokens`（DeepSeek 扩展，OpenBitFun 优先读）与 `prompt_tokens_details.cached_tokens`（OpenAI 标准），并用 `x_139.usage_source = "estimated"` 标记为估算值；控制台「调用统计」页的命中率分母只统计上报过缓存字段的调用。
+因此网关按**前缀复用**估算缓存命中：取「与同一会话上一轮请求的最长公共前缀」。百炼的隐式上下文缓存自动开启、无法关闭，机制正是「最长匹配前缀命中」——该前缀即理论上可命中的部分。
 
-关闭：环境变量 `GATEWAY_CACHE_ESTIMATE=0`，或 `config.json` 中 `{"cacheEstimate": false}`。
+按百炼文档校准：**最少可缓存 1024 Token**，低于该值不建立缓存（网关上报 0，原始量见 `x_139.cache_prefix_tokens`）；隐式缓存无固定有效期且命中率不保证，故本值是**上限估算**。
+
+响应同时给出 `prompt_cache_hit_tokens`（DeepSeek 扩展，OpenBitFun 优先读）与 `prompt_tokens_details.cached_tokens`（OpenAI 标准），并以 `x_139.usage_source = "estimated"` 标记；控制台「调用统计」的命中率分母只统计上报过缓存字段的调用。
+
+关闭：环境变量 `GATEWAY_CACHE_ESTIMATE=0`，或 `config.json` 中 `{"cacheEstimate": false}`。**真实计量**只能从百炼控制台（模型监控 `cache_tokens` / 账单明细「缓存命中」）查，那属于 139/中国移动的账号。
 </details>
 
 <details>

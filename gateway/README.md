@@ -148,27 +148,36 @@ sid+cookie ──POST queryUserToken──▶ RCS token(≈25天) ──▶ Basi
 
 ## token 用量与缓存命中（估算）
 
-**上游不提供任何计量数据**：139 上游的 SSE 事件里没有 `usage` 字段（实测事件只含
-`data.flowResult.{outContent,reasoningContent,finishReason,outAuditStatus…}`、会话 id 与推荐追问），
-139 网页版自身也从未调用任何用量/计费接口 —— 即平台没有把百炼（DashScope）的 usage 与隐式上下文
-缓存计量透传给客户端。因此网关只能估算：
+**上游不提供任何计量数据**，这是链路上三跳共同决定的：
+
+1. **百炼侧**：OpenAI 兼容接口的流式计量需要调用方显式设置 `stream_options.include_usage = true`（**默认 `false`**），否则最后一个数据块不含 `usage`；
+2. **139 平台侧**：其客户端 API（`/chat/v2/add`）的请求体与网页版官方客户端**逐字段一致**（已从 4.7MB 前端包中提取比对），**没有任何请求计量的参数**；36 个前端 chunk 全量扫描也**零命中** `include_usage`/`stream_options`/`prompt_tokens`/`cached_tokens`/`cache_control` 等标识，网页版自身也不展示任何用量/计费信息；
+3. 因此**开关在「139 平台 → 百炼」那一跳，客户端无从控制**，`usage` 与缓存计量不可能到达我们这里。
+
+网关只能估算：
 
 | 指标 | 估算方式 | 落盘字段 |
 |---|---|---|
 | `prompt_tokens` / `completion_tokens` | 字符数 × 0.6 | `promptTokens` / `completionTokens` |
 | 缓存命中 `cached_tokens` | **前缀复用**：与同一会话上一轮请求的最长公共前缀 | `cacheTokens` |
 
-**为什么前缀复用等价于缓存命中**：对话逐轮追加时，上一轮发送的全部内容就是本轮 prompt 的前缀，
-而百炼/主流服务商的上下文缓存正是按「最长匹配前缀」计费的 —— 该前缀命中多少，就是缓存省下多少。
+**为什么前缀复用等价于缓存命中**：百炼的隐式上下文缓存自动开启、**无法关闭**，机制就是「按最长匹配前缀命中」，命中部分按输入单价的 10%~40% 计费。对话逐轮追加时，上一轮发送的全部内容即本轮 prompt 的前缀 —— 该前缀就是理论上可命中的部分。
 
-- 响应中同时给出 `usage.prompt_cache_hit_tokens`（DeepSeek 扩展，OpenBitFun 优先读取）、
-  `usage.prompt_tokens_details.cached_tokens`（OpenAI 标准）与 `prompt_cache_miss_tokens`
-- 并标记 `x_139.usage_source = "estimated"` + `x_139.cache_estimate_tokens`，便于客户端区分「计量值 / 估算值」
+**按百炼文档校准的两条规则**：
+
+- **最少可缓存 Token 数 = 1024**：低于该值百炼不会建立缓存，网关因此上报 0（避免假命中）；原始前缀量仍在 `x_139.cache_prefix_tokens` 中给出
+- 隐式缓存**无固定有效期**（系统定期清理）且**命中率不保证**，所以本值是**可缓存前缀的上限估算**，不等于实际命中
+
+响应同时给出 `usage.prompt_cache_hit_tokens`（DeepSeek 扩展，OpenBitFun 优先读取）、
+`usage.prompt_tokens_details.cached_tokens`（OpenAI 标准）与 `prompt_cache_miss_tokens`，
+并标记 `x_139.usage_source = "estimated"`。
+
 - 统计页的命中率分母只包含**上报过缓存字段**的调用，历史记录不会稀释命中率
 - 关闭估算：环境变量 `GATEWAY_CACHE_ESTIMATE=0`，或 `config.json` 写 `{"cacheEstimate": false}`
   （关闭后仍会发送 `cached_tokens: 0`，客户端通常显示为「未上报缓存」）
 
-> 该数值用于观察趋势与成本结构，**不等于**运营商账单口径的缓存命中量。
+> **想要真实计量**只能从调用方（139/中国移动）的百炼账号侧取：百炼控制台 →「模型监控」的
+> `cache_tokens` 指标，或「账单明细」按计费类型筛选「缓存命中」。本网关拿不到该账号。
 
 ## 文件结构
 

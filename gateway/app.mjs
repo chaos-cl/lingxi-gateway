@@ -377,6 +377,8 @@ const estTokens = (chars) => Math.ceil(chars * 0.6); // 粗略估算，仅用于
 const CACHE_PROMPTS = new Map(); // key → { prompt, at }
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 64;
+// 百炼文档：上下文缓存「最少可缓存 Token 数 = 1024」（隐式/显式同），低于此值不可能命中，故不计入
+const CACHE_MIN_TOKENS = 1024;
 
 function cacheConvKey(messages, modelId) {
   const str = (v) => (typeof v === "string" ? v : JSON.stringify(v ?? ""));
@@ -459,10 +461,12 @@ async function handleChat(req, res, body, deps) {
     return oaiError(res, e.status || 400, e.message);
   }
 
-  // 缓存命中估算（前缀复用）：必须在本轮调用前算，并把本轮 prompt 记为下轮基准
-  const cacheTokens = config.cacheEstimate === false
+  // 缓存命中估算（前缀复用）：必须在本轮调用前算，并把本轮 prompt 记为下轮基准。
+  // 可缓存前缀 < 1024 token 时百炼不会建立缓存 → 上报 0，避免假命中。
+  const cachePrefixTokens = config.cacheEstimate === false
     ? 0
     : estTokens(estimateCacheChars(cacheConvKey(messages, modelObj.id), dialogue));
+  const cacheTokens = cachePrefixTokens >= CACHE_MIN_TOKENS ? cachePrefixTokens : 0;
 
   // 客户端断开 → 中止上游。
   // 超时策略：空闲超时（上游 3 分钟无新数据视为卡死）+ 30 分钟总时长硬上限。
@@ -508,7 +512,7 @@ async function handleChat(req, res, body, deps) {
       prompt_cache_miss_tokens: Math.max(0, promptTokens - cacheTokens),
     };
   };
-  const usageSource = cacheTokens > 0 ? "estimated" : "estimated_no_prefix_reuse";
+  const usageSource = "estimated"; // 上游不返回计量，token 与缓存命中均为估算（见 README「token 用量与缓存命中」）
   let content = "", reasoning = "", modelUsed = "", sidOut = "", statement = "", citations = [];
   let toolCallCount = 0;
   // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
@@ -556,7 +560,7 @@ async function handleChat(req, res, body, deps) {
           finish_reason: toolCallsOut.length ? "tool_calls" : "stop",
         }],
         usage: usageBlock(),
-        x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, elapsed_ms: Date.now() - t0, usage_source: usageSource, cache_estimate_tokens: cacheTokens },
+        x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, elapsed_ms: Date.now() - t0, usage_source: usageSource, cache_estimate_tokens: cacheTokens, cache_prefix_tokens: cachePrefixTokens },
       }));
       finalize();
       return;
@@ -609,7 +613,7 @@ async function handleChat(req, res, body, deps) {
     res.write(`data: ${JSON.stringify({
       ...baseChunk({}),
       choices: [{ index: 0, delta: {}, finish_reason: sawToolCall ? "tool_calls" : "stop" }],
-      x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, usage_source: usageSource, cache_estimate_tokens: cacheTokens },
+      x_139: { session_id: sidOut, model_used: modelUsed, statement, citations, usage_source: usageSource, cache_estimate_tokens: cacheTokens, cache_prefix_tokens: cachePrefixTokens },
     })}\n\n`);
     // usage chunk：无条件发送（OpenBitFun 等客户端不带 stream_options.include_usage，
     // 但其 token 用量/TPS 显示依赖流内 usage 块；choices:[] 的 usage 帧是 OpenAI 官方 include_usage 语义，多余无害）
