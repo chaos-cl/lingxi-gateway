@@ -67,6 +67,9 @@ function writeJsonFile(file, obj, mode = 0o600) {
  * @param {string} [opts.adminToken]  管理 API 令牌（缺省自动生成并落盘）
  * @param {(line:string)=>void} [opts.onLog] 日志回调（桌面 App 收集显示）
  */
+// 供离线回归测试取用（工具调用解析器；由 createGateway 内部填充）
+export const __internals = {};
+
 export function createGateway(opts = {}) {
   const dataDir = opts.dataDir || GATEWAY_DIR;
   const CRED_FILE = path.join(dataDir, "credentials.json");
@@ -210,6 +213,7 @@ function renderToolsPrompt(tools) {
     "上述 JSON 必须严格合法：arguments 里字符串值内部的引号必须用反斜杠转义（\\\"）。例如 shell 命令：\n" +
     '<tool_call>\n{"name": "ExecCommand", "arguments": {"cmd": "grep \\"foo\\" file.txt"}}\n</tool_call>\n' +
     "工具执行结果将以 <tool_response> 块返回给你，根据结果继续回答或再次调用。\n" +
+    "单次工具调用的参数体积请控制在 6000 字符以内：大文件先写骨架，再用 Edit 分段补全（上游单次输出长度有限，过长会被截断）。\n" +
     "若无需使用工具，直接用文字回答。"
   );
 }
@@ -263,32 +267,111 @@ function repairUnescapedQuotes(s) {
   return out;
 }
 
-/** <tool_call> 内容 → OpenAI tool_call 结构；解析失败返回 null */
-function parseToolCallText(inner, index) {
-  let raw = inner.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  let obj = null;
-  try { obj = JSON.parse(raw); } catch {
-    const a = raw.indexOf("{"), b = raw.lastIndexOf("}"); // 宽容：剥掉前后杂文字
-    const body = a >= 0 && b > a ? raw.slice(a, b + 1) : raw;
-    try { obj = JSON.parse(body); } catch {
-      try { obj = JSON.parse(repairUnescapedQuotes(body)); } catch { /* 抢救失败，回退文本 */ }
-    }
-  }
-  if (!obj || typeof obj !== "object") return null;
-  const name = obj.name ?? obj.function?.name ?? obj.tool_name;
-  if (!name || typeof name !== "string") return null;
-  let args = obj.arguments ?? obj.function?.arguments ?? obj.parameters ?? obj.args ?? {};
-  if (typeof args === "string") {
-    try { args = JSON.parse(args); } catch {
-      try { args = JSON.parse(repairUnescapedQuotes(args)); } catch { /* 保持字符串原样 */ }
-    }
-  }
+/**
+ * <tool_call> 块 → OpenAI tool_call 结构。
+ * 上游模型会混用三种方言，必须全部支持：
+ *   1) JSON：       {"name":"Edit","arguments":{...}}
+ *   2) HERMES XML： <function=Read>\n<parameter=path>\n/a.txt\n</parameter>\n</function>
+ *   3) invoke XML： <invoke name="Edit"><parameter name="file_path">…</parameter>
+ * 一个块内可能有多个并行调用，故返回数组。
+ */
+function mkToolCall(name, args, index) {
   return {
     id: "call_139_" + crypto.randomUUID().slice(0, 8),
     index,
     type: "function",
     function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) },
   };
+}
+
+/** <parameter=KEY>value</parameter> 或 <parameter name="KEY">value</parameter> 序列 → 对象 */
+function parseXmlParams(body) {
+  const args = {};
+  const re = /<parameter\s*(?:=\s*([^>\s]+)|name\s*=\s*["']([^"']+)["'])\s*>/g;
+  const marks = [];
+  let m;
+  while ((m = re.exec(body))) marks.push({ key: (m[1] || m[2] || "").trim(), start: re.lastIndex, tagStart: m.index });
+  for (let i = 0; i < marks.length; i++) {
+    const end = i + 1 < marks.length ? marks[i + 1].tagStart : body.length; // 值止于下一个标签的起始 '<'
+    let val = body.slice(marks[i].start, end);
+    val = val
+      .replace(/<\/parameter>\s*$/i, "")
+      .replace(/<\/function>\s*$/i, "")
+      .replace(/<\/invoke>\s*$/i, "")
+      .replace(/<\/tool_call>\s*$/i, "")
+      .replace(/^\r?\n/, "")
+      .replace(/\s+$/, "");
+    if (marks[i].key) args[marks[i].key] = val;
+  }
+  return args;
+}
+
+/** qwen HERMES：<function=NAME> … </function>，可连续多个 */
+function parseHermesCalls(raw) {
+  const out = [];
+  const re = /<function\s*(?:=\s*([^>\s]+)|name\s*=\s*["']([^"']+)["'])\s*>\s*([\s\S]*?)(?=<\/function>|(?=<function\s*(?:=|name\s*=))|$)/g;
+  let m;
+  while ((m = re.exec(raw))) out.push({ name: (m[1] || m[2] || "").trim(), args: parseXmlParams(m[3] || "") });
+  return out.filter((c) => c.name);
+}
+
+/** Anthropic 风格：<invoke name="NAME">…</invoke>（模型常省略 </invoke>） */
+function parseInvokeCalls(raw) {
+  const out = [];
+  const re = /<invoke\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)(?=<\/invoke>|(?=<invoke\s)|$)/g;
+  let m;
+  while ((m = re.exec(raw))) out.push({ name: m[1].trim(), args: parseXmlParams(m[2] || "") });
+  return out.filter((c) => c.name);
+}
+
+/** JSON 客体/数组（含 shell 命令裸引号抢救） */
+function parseJsonCalls(raw) {
+  const tryParse = (s) => {
+    try { return JSON.parse(s); } catch {
+      try { return JSON.parse(repairUnescapedQuotes(s)); } catch { return null; }
+    }
+  };
+  let obj = tryParse(raw);
+  if (!obj) {
+    const a = raw.indexOf("{"), b = raw.lastIndexOf("}"); // 宽容：剥掉前后杂文字
+    if (a >= 0 && b > a) obj = tryParse(raw.slice(a, b + 1));
+  }
+  if (!obj) return [];
+  const list = Array.isArray(obj) ? obj : Array.isArray(obj.tool_calls) ? obj.tool_calls : [obj];
+  const out = [];
+  for (const it of list) {
+    const name = it?.name ?? it?.function?.name ?? it?.tool_name;
+    if (!name || typeof name !== "string") continue;
+    let args = it.arguments ?? it.function?.arguments ?? it.parameters ?? it.args ?? {};
+    if (typeof args === "string") { const p = tryParse(args); if (p) args = p; }
+    out.push({ name, args });
+  }
+  return out;
+}
+
+/** 块内容 → tool_call 数组（按方言优先级尝试） */
+function parseToolCallBlock(inner, index) {
+  const raw = String(inner || "").trim().replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/, "").trim();
+  if (!raw) return [];
+  for (const group of [parseHermesCalls(raw), parseInvokeCalls(raw), parseJsonCalls(raw)]) {
+    if (group.length) return group.map((c, i) => mkToolCall(c.name, c.args, index + i));
+  }
+  return [];
+}
+
+/** 是否看起来是工具协议残片（而非正常正文） */
+function looksLikeProtocol(s) {
+  return /<function\s*=|<\/function>|<parameter\s*=|<\/parameter>|<invoke\s|"arguments"\s*:/.test(String(s || ""));
+}
+
+/** 截断/不可解析块的提示：认出工具名并给出可执行的纠正建议（替代把原始协议泄漏给用户） */
+function truncatedNotice(inner) {
+  const raw = String(inner || "");
+  const name =
+    (raw.match(/<function\s*(?:=\s*|name\s*=\s*["'])([^"'>\s]+)/) || [])[1] ||
+    (raw.match(/<invoke\s+name\s*=\s*["']([^"']+)["']/) || [])[1] ||
+    (raw.match(/"name"\s*:\s*"([^"]+)"/) || [])[1] || "";
+  return `\n[网关] 工具调用未完成${name ? `（${name}）` : ""}：输出在 ${raw.length} 字符处中断，疑似达到上游单次输出长度上限，该调用已丢弃。请把大文件拆成多次较小写入（先写骨架，再用 Edit 分段追加），或缩小单次改动范围。\n`;
 }
 
 class ToolCallExtractor {
@@ -300,9 +383,14 @@ class ToolCallExtractor {
   flush() {
     const events = this._drain(true);
     if (this.inCall) {
-      const call = parseToolCallText(this.pend, this.nextIndex);
-      if (call) { events.push({ type: "tool_call", call }); this.nextIndex++; }
-      else if (this.pend.trim()) events.push({ type: "text", text: TC_OPEN + this.pend });
+      const calls = parseToolCallBlock(this.pend, this.nextIndex);
+      if (calls.length) {
+        for (const c of calls) events.push({ type: "tool_call", call: c });
+        this.nextIndex += calls.length;
+      } else if (this.pend.trim()) {
+        // 流在块中间结束：协议残片不回显原文，改为可执行的提示
+        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? truncatedNotice(this.pend) : TC_OPEN + this.pend });
+      }
       this.pend = ""; this.inCall = false;
     } else if (this.pend) {
       const cleaned = this.pend.replace(STRAY_CLOSE_RE, "");
@@ -338,15 +426,20 @@ class ToolCallExtractor {
         const inner = this.pend.slice(0, j);
         this.pend = this.pend.slice(j + TC_CLOSE.length);
         this.inCall = false;
-        const call = parseToolCallText(inner, this.nextIndex);
-        if (call) { events.push({ type: "tool_call", call }); this.nextIndex++; }
-        else if (inner.trim()) events.push({ type: "text", text: TC_OPEN + inner + TC_CLOSE }); // 非法内容回退为文本
+        const calls = parseToolCallBlock(inner, this.nextIndex);
+        if (calls.length) {
+          for (const c of calls) events.push({ type: "tool_call", call: c });
+          this.nextIndex += calls.length;
+        } else if (inner.trim()) {
+          // 解析不出结构化调用：协议残片只给提示，正常正文原样保留
+          events.push({ type: "text", text: looksLikeProtocol(inner) ? truncatedNotice(inner) : TC_OPEN + inner + TC_CLOSE });
+        }
         continue;
       }
-      // 防失控：缓冲超限且无闭合标签，放弃解析当正文吐出
+      // 防失控：缓冲超限且无闭合标签，放弃解析（协议残片只给提示）
       if (final || this.pend.length > 65536) {
         if (final) return events; // 交给 flush() 处理
-        events.push({ type: "text", text: TC_OPEN + this.pend });
+        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? truncatedNotice(this.pend) : TC_OPEN + this.pend });
         this.pend = ""; this.inCall = false;
         return events;
       }
@@ -354,6 +447,10 @@ class ToolCallExtractor {
     }
   }
 }
+
+// 供离线回归测试使用（真实模型输出样本 → 结构化调用）
+__internals.parseToolCallBlock = parseToolCallBlock;
+__internals.ToolCallExtractor = ToolCallExtractor;
 
 function lastUserText(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {

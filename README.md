@@ -241,7 +241,19 @@ export OPENAI_API_KEY=any
 
 **1. 模型是账号级全局状态** — 上游通过 `POST /chat/config` 切换模型，同一账号并发使用不同模型会互相覆盖。网关用互斥锁保护「切模型 → 对话首包」临界区，首包到达后立刻释放。
 
-**2. 上游无 function calling** — 网关在请求侧把 `tools` 数组渲染为 qwen HERMES 风格的工具说明注入对话；响应侧用流式状态机把模型输出的 `<tool_call>{...}</tool_call>` 转回标准 `delta.tool_calls`，并处理了跨 chunk 标签切断、未转义引号（shell 命令常见）、多余闭合标签等边界情况。
+**2. 上游无 function calling** — 网关在请求侧把 `tools` 数组渲染为 qwen HERMES 风格的工具说明注入对话；响应侧用流式状态机把模型输出转回标准 `delta.tool_calls`。
+
+实际观测到模型会用**三种方言**输出工具调用，网关全部兼容（同一块内多个并行调用也支持）：
+
+| 方言 | 形态 |
+|---|---|
+| JSON | `<tool_call>{"name": "Edit", "arguments": {...}}</tool_call>` |
+| HERMES XML | `<tool_call><function=Read><parameter=path>/a.txt</parameter></function></tool_call>` |
+| invoke XML | `<tool_call><invoke name="Edit"><parameter name="file_path">…</parameter></tool_call>`（常缺 `</invoke>`） |
+
+同时处理了跨 chunk 标签切断、未转义引号（shell 命令常见）、多余闭合标签等边界情况。**若模型输出被上游长度上限截断**（大 `Write` 的 payload 过长时会发生），网关不会把半截协议吐给客户端，而是丢弃该调用并回一句 `[网关] 工具调用未完成（Write）…` 提示模型改用分段写入。
+
+回归自测：`node tests/tool-calls.test.mjs`（28 项，样本取自真实会话日志）。
 
 ---
 
@@ -265,6 +277,24 @@ Get-NetTCPConnection -LocalPort 8317 | Select-Object OwningProcess
 <summary><b>控制台提示「邮箱会话已过期（FA_INVALID_SESSION）」</b></summary>
 
 邮箱登录会话（sid）失效，需要重新连接账号：用「登录助手」重新登录一次即可，Token 会自动重铸。
+
+注意：已缓存的 Token 有效期内（约 25 天）**不影响正在运行的网关**，所以可能表现为「重启前一直好好的，一重启就报会话过期」——本质是 sid 早已不能铸造新 Token 了，重启后必须重新登录一次。
+</details>
+
+<details>
+<summary><b>工具调用没有执行 / 正文里冒出 &lt;tool_call&gt; 标签</b></summary>
+
+先确认网关版本 ≥ v1.1.4（旧版只认 JSON 方言，模型改用 HERMES/invoke 方言时会漏成正文）。升级后跑一次自测：
+
+```bash
+node tests/tool-calls.test.mjs
+```
+</details>
+
+<details>
+<summary><b>正文出现「[网关] 工具调用未完成（Write）」</b></summary>
+
+模型单次输出的体积撞到了上游长度上限，工具调用被截断（27K 字符级别的 `Write` payload 必然触发）。网关会丢弃半截调用并提示模型分段写，通常下一轮就会改成「先写骨架 → 再 Edit 追加」。若频繁出现，可在系统提示里进一步要求每次写入不超过 6000 字符。
 </details>
 
 <details>

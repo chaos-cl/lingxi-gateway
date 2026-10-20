@@ -1,0 +1,129 @@
+/**
+ * 工具调用解析回归测试（零依赖，node 即可跑）
+ *
+ *   node tests/tool-calls.test.mjs
+ *
+ * 覆盖上游模型实际出现过的三种方言（JSON / HERMES XML / <invoke> XML）、
+ * 一个块内多个并行调用、跨 chunk 切断、以及输出被上游截断时的降级行为。
+ * 样本来自 OpenBitFun 会话日志中的真实模型输出。
+ */
+import { createGateway, __internals } from "../gateway/app.mjs";
+
+// 只做构造（不 start），取内部解析器
+createGateway({ dataDir: "/tmp/lx-selftest", adminToken: "selftest" });
+const { parseToolCallBlock, ToolCallExtractor } = __internals;
+if (!parseToolCallBlock || !ToolCallExtractor) {
+  console.error("无法取得解析器（__internals 未填充）");
+  process.exit(1);
+}
+
+let pass = 0, fail = 0;
+const ok = (cond, msg, extra = "") => {
+  if (cond) { pass++; console.log(`  ✓ ${msg}`); }
+  else { fail++; console.log(`  ✗ ${msg}${extra ? " → " + extra : ""}`); }
+};
+const callsOf = (events) => events.filter((e) => e.type === "tool_call").map((e) => e.call);
+const textOf = (events) => events.filter((e) => e.type === "text").map((e) => e.text).join("");
+const argsOf = (c) => JSON.parse(c.function.arguments);
+
+function run(raw, chunkSize = 0) {
+  const ex = new ToolCallExtractor();
+  const out = [];
+  if (chunkSize > 0) {
+    for (let i = 0; i < raw.length; i += chunkSize) out.push(...ex.feed(raw.slice(i, i + chunkSize)));
+  } else out.push(...ex.feed(raw));
+  out.push(...ex.flush());
+  return out;
+}
+
+/* ---------------- 真实样本（截自会话日志） ---------------- */
+
+const S_HERMES_EMPTY = `<tool_call>\n<function=Read>\n</function>\n</tool_call>`;
+
+const S_INVOKE = `<tool_call>\n<invoke name="Edit"><parameter name="file_path">/Users/chaos/demo/index.html</parameter><parameter name="old_string">const edges = new THREE.EdgesGeometry(geo, 30);\nscene.add(edges);</parameter><parameter name="new_string">const edgeRoot = new THREE.Group();\nedgeRoot.name = 'outlines';\nscene.add(edgeRoot);`;
+
+const S_JSON_TRUNCATED = `<tool_call>\n{"name": "Write", "arguments": {"payload": "+++ /Users/chaos/demo/index.html\\n<!DOCTYPE html>\\n<html>\\n<head>\\n<script src=\\"https://unpkg.com/three@0.160.0/build/three.module.js`;
+
+const S_HERMES_OK = `<tool_call>\n<function=ExecCommand>\n<parameter=cmd>\ncd /tmp && ls -l | wc -l -c index.html && grep -c "three" index.html\n</parameter>\n</function>\n</tool_call>`;
+
+console.log("\n=== 1. HERMES XML（空参数） ===");
+{
+  const ev = run(S_HERMES_EMPTY);
+  const c = callsOf(ev);
+  ok(c.length === 1, "产出 1 个 tool_call", `got ${c.length}`);
+  ok(c[0]?.function.name === "Read", "工具名 = Read", c[0]?.function.name);
+  ok(!textOf(ev).includes("<function="), "正文无协议残留");
+}
+
+console.log("\n=== 2. <invoke> 方言（未闭合 + 大段代码参数） ===");
+{
+  const ev = run(S_INVOKE);
+  const c = callsOf(ev);
+  const a = c[0] ? argsOf(c[0]) : {};
+  ok(c.length === 1, "产出 1 个 tool_call", `got ${c.length}`);
+  ok(c[0]?.function.name === "Edit", "工具名 = Edit", c[0]?.function.name);
+  ok(!!a.file_path?.endsWith("index.html"), "file_path 未把下一个标签吞进去", a.file_path);
+  ok((a.old_string || "").includes("EdgesGeometry"), "old_string 含代码");
+  ok((a.new_string || "").includes("edgeRoot"), "new_string 含代码");
+  ok(!textOf(ev).includes("<invoke"), "正文无协议残留");
+}
+
+console.log("\n=== 3. JSON 被上游截断（不可补救 → 降级提示） ===");
+{
+  const ev = run(S_JSON_TRUNCATED);
+  const t = textOf(ev);
+  ok(callsOf(ev).length === 0, "不产出半截 tool_call（避免写坏文件）");
+  ok(t.includes("[网关]") && t.includes("Write"), "提示里带工具名", t.slice(0, 60));
+  ok(!t.includes('"arguments"') && !t.includes("<tool_call>"), "正文无原始协议泄漏");
+}
+
+console.log("\n=== 4. HERMES XML（命令含引号/管道） ===");
+{
+  const c = callsOf(run(S_HERMES_OK));
+  ok(c.length === 1, "产出 1 个 tool_call", `got ${c.length}`);
+  ok(c[0]?.function.name === "ExecCommand", "工具名 = ExecCommand", c[0]?.function.name);
+  const a = c[0] ? argsOf(c[0]) : {};
+  ok((a.cmd || "").includes("wc -l -c index.html"), "cmd 完整");
+  ok((a.cmd || "").includes('grep -c "three"'), "cmd 内引号未被破坏");
+}
+
+console.log("\n=== 5. JSON 方言（原有能力不回归） ===");
+{
+  const c = callsOf(run('<tool_call>\n{"name": "Edit", "arguments": {"file_path": "/a.txt", "old_string": "a", "new_string": "b"}}\n</tool_call>'));
+  ok(c.length === 1 && c[0].function.name === "Edit", "正常 JSON");
+  const c2 = callsOf(run('<tool_call>\n{"name": "ExecCommand", "arguments": {"cmd": "grep "foo" bar.txt"}}\n</tool_call>'));
+  ok(c2.length === 1, "未转义引号可抢救", `got ${c2.length}`);
+  ok(c2[0] && argsOf(c2[0]).cmd.includes('"foo"'), "引号内容保留");
+}
+
+console.log("\n=== 6. 跨 chunk 切断（流式边界） ===");
+{
+  const raw = `前文<tool_call>\n<function=Read>\n<parameter=path>\n/Users/a b.txt\n</parameter>\n</function>\n</tool_call>后文`;
+  const ev = run(raw, 7);
+  const c = callsOf(ev);
+  ok(c.length === 1 && c[0].function.name === "Read", "7 字符切片下仍解析");
+  ok(c[0] && argsOf(c[0]).path === "/Users/a b.txt", "参数含空格正确");
+  const t = textOf(ev);
+  ok(t.startsWith("前文") && t.endsWith("后文"), "正文前后文保留", JSON.stringify(t));
+}
+
+console.log("\n=== 7. 一个块内并行多个调用 ===");
+{
+  const raw = `<tool_call>\n<function=Read>\n<parameter=path>\n/a\n</parameter>\n</function>\n<function=Read>\n<parameter=path>\n/b\n</parameter>\n</function>\n</tool_call>`;
+  const c = callsOf(run(raw));
+  ok(c.length === 2, "产出 2 个并行调用", `got ${c.length}`);
+  ok(c[0].index === 0 && c[1].index === 1, "index 递增", c.map((x) => x.index).join(","));
+  ok(argsOf(c[1]).path === "/b", "第二个参数正确");
+}
+
+console.log("\n=== 8. 多余闭合标签 / 普通正文不误判 ===");
+{
+  const ev = run(`<tool_call>\n<function=Read>\n<parameter=path>\n/a\n</parameter>\n</function>\n</tool_call>\n\n</tool_call>\n\n</tool_call>`);
+  ok(callsOf(ev).length === 1, "解析出 1 个调用");
+  ok(!textOf(ev).includes("</tool_call>"), "无多余闭合标签残留", JSON.stringify(textOf(ev)));
+  const ev2 = run("这段代码的 arguments 对象是函数入参，注意别混淆。");
+  ok(callsOf(ev2).length === 0 && textOf(ev2).includes("arguments"), "正文含 arguments 原样保留");
+}
+
+console.log(`\n===== ${pass} 通过 / ${fail} 失败 =====`);
+process.exit(fail ? 1 : 0);

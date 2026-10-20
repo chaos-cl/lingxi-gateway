@@ -1,7 +1,7 @@
 {
   "name": "lingxi-gateway",
   "productName": "灵犀网关",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "description": "139 邮箱 AI 工作台（灵犀/MClaw）→ OpenAI 兼容网关 · 桌面控制台（连接账号 / 续期 / 调用量统计）",
   "author": "chaos-cl",
   "license": "MIT",
@@ -44,7 +44,13 @@
       "icon": "build/icon.icns",
       "category": "public.app-category.developer-tools",
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ],
       "artifactName": "LingxiGateway-${version}-mac-${arch}.${ext}",
       "identity": "-",
@@ -56,16 +62,35 @@
     "dmg": {
       "title": "灵犀网关 ${version}",
       "contents": [
-        { "x": 140, "y": 200, "type": "file" },
-        { "x": 400, "y": 200, "type": "link", "path": "/Applications" }
+        {
+          "x": 140,
+          "y": 200,
+          "type": "file"
+        },
+        {
+          "x": 400,
+          "y": 200,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     },
     "win": {
       "icon": "build/icon.ico",
       "executableName": "LingxiGateway",
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "zip", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "artifactName": "LingxiGateway-${version}-win-x64.${ext}"
     },
@@ -81,7 +106,9 @@
     "linux": {
       "icon": "build/icon.png",
       "category": "Development",
-      "target": ["AppImage"]
+      "target": [
+        "AppImage"
+      ]
     }
   }
 }
