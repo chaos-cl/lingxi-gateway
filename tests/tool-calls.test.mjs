@@ -68,12 +68,14 @@ console.log("\n=== 2. <invoke> 方言（未闭合 + 大段代码参数） ===");
   ok(!textOf(ev).includes("<invoke"), "正文无协议残留");
 }
 
-console.log("\n=== 3. JSON 被上游截断（不可补救 → 降级提示） ===");
+console.log("\n=== 3. JSON 被上游截断（补发空参数调用，保住 agent 循环） ===");
 {
   const ev = run(S_JSON_TRUNCATED);
   const t = textOf(ev);
-  ok(callsOf(ev).length === 0, "不产出半截 tool_call（避免写坏文件）");
-  ok(t.includes("[网关]") && t.includes("Write"), "提示里带工具名", t.slice(0, 60));
+  const c = callsOf(ev);
+  ok(c.length === 1 && c[0].function.name === "Write", "补发 Write 空参数调用", `got ${c.length}`);
+  ok(c[0]?.function.arguments === "{}", "绝不携带半截 payload（避免写坏文件）", c[0]?.function.arguments);
+  ok(t.includes("[网关]") && t.includes("Write"), "提示里带工具名与原因", t.slice(0, 50));
   ok(!t.includes('"arguments"') && !t.includes("<tool_call>"), "正文无原始协议泄漏");
 }
 
@@ -148,13 +150,23 @@ console.log("\n=== 10. 宽松 JSON 修复（裸换行 / 尾随逗号） ===");
   ok(a.payload === "line1\nline2,\nline3", "多行内容完整保留", JSON.stringify(a.payload));
 }
 
-console.log("\n=== 11. 提示语区分「解析失败」与「被截断」 ===");
+console.log("\n=== 11. 提示语区分「格式不完整」与「被截断」 ===");
 {
   const closedBad = textOf(run('<tool_call>\n{"name": "Write", "arguments": {"payload": }}\n</tool_call>'));
-  ok(closedBad.includes("解析失败") && !closedBad.includes("被截断"), "已闭合但不合法 → 解析失败", closedBad.slice(0, 60));
+  ok(closedBad.includes("格式不完整") && !closedBad.includes("被截断"), "已闭合但不合法 → 格式不完整", closedBad.slice(0, 60));
   const unclosed = textOf(run('<tool_call>\n{"name": "Write", "arguments": {"payload": "+++ /a\\n<div'));
   ok(unclosed.includes("被截断"), "未闭合 → 被截断", unclosed.slice(0, 60));
-  ok(!/输出在 \d+ 字符处中断，疑似达到上游单次输出长度上限/.test(unclosed), "不再武断归因于上游上限");
+  ok(!/疑似达到上游单次输出长度上限/.test(unclosed), "不再武断归因于上游上限");
+}
+
+console.log("\n=== 15. JSON 头 + XML 结尾的杂交体（线上真实样本） ===");
+{
+  // 原文只有 53 字符：{"name": "CallDeferredTool",\n</parameter>\n</invoke>
+  const ev = run('<tool_call>\n{"name": "CallDeferredTool",\n</parameter>\n</invoke>\n</tool_call>');
+  const c = callsOf(ev);
+  ok(c.length === 1 && c[0].function.name === "CallDeferredTool", "识别出工具名并补发调用", JSON.stringify(c.map((x) => x.function.name)));
+  ok(c[0]?.function.arguments === "{}", "参数为空（交给客户端校验后让模型重试）");
+  ok(textOf(ev).includes("格式不完整"), "附带原因说明");
 }
 
 console.log("\n=== 12. 弯引号 “”（真实故障：模型用中文引号写 JSON） ===");

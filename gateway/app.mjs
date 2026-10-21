@@ -455,8 +455,11 @@ function looksLikeProtocol(s) {
   return /<function\s*=|<\/function>|<parameter\s*=|<\/parameter>|<invoke\s|"arguments"\s*:/.test(String(s || ""));
 }
 
-/** 工具协议残片的诊断提示：区分「被截断」与「格式不合法」，各自给出可执行的纠正方式 */
-function toolCallNotice(inner, { closed = false } = {}) {
+/**
+ * 工具协议残片的诊断提示：区分「被截断」与「格式不合法」，各自给出可执行的纠正方式。
+ * 返回 name 时调用方会补发一个空参数调用，保证 agent 循环不被掐断。
+ */
+function toolCallFailure(inner, { closed = false } = {}) {
   const s = String(inner || "");
   // 留档：解析失败的原始块写到 data/failed-toolcalls/（保留最近 20 份），便于事后定位是哪种畸形；
   // 另可用 LINGXI_CAPTURE_DIR 指定目录。
@@ -464,8 +467,7 @@ function toolCallNotice(inner, { closed = false } = {}) {
   for (const dir of dumpDirs) {
     try {
       fs.mkdirSync(dir, { recursive: true });
-      const file = path.join(dir, `failed-${Date.now()}.txt`);
-      fs.writeFileSync(file, s);
+      fs.writeFileSync(path.join(dir, `failed-${Date.now()}.txt`), s);
       const old = fs.readdirSync(dir).filter((f) => /^failed-\d+\.txt$/.test(f)).sort().slice(0, -20);
       for (const f of old) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ } }
       break; // 成功一处即可
@@ -474,13 +476,12 @@ function toolCallNotice(inner, { closed = false } = {}) {
   const name =
     (s.match(/<function\s*(?:=\s*|name\s*=\s*["'])([^"'>\s]+)/) || [])[1] ||
     (s.match(/<invoke\s+name\s*=\s*["']([^"']+)["']/) || [])[1] ||
-    (s.match(/"name"\s*:\s*"([^"]+)"/) || [])[1] || "";
+    (s.match(/"name"\s*:\s*["“”']([^"“”'\s]+)["“”']/) || [])[1] || "";
   const who = name ? `（${name}）` : "";
-  if (closed) {
-    const head = s.trim().replace(/\s+/g, " ").slice(0, 120);
-    return `\n[网关] 工具调用解析失败${who}：该块 ${s.length} 字符，但不是合法的 JSON/XML，已丢弃。请用 {"name": "工具名", "arguments": {...}}，字符串内的引号与换行必须转义。开头片段：${head}\n`;
-  }
-  return `\n[网关] 工具调用被截断${who}：输出在 ${s.length} 字符处中断（未出现闭合标签），已丢弃该调用。请缩小单次调用的参数体积，或改为分段写入。\n`;
+  const text = closed
+    ? `\n[网关] 工具调用格式不完整${who}：该块 ${s.length} 字符但参数无法解析（常见原因：JSON 与 XML 标签混用、引号未转义）。已丢弃参数并重新发起该调用，请补全参数后重试。\n`
+    : `\n[网关] 工具调用被截断${who}：输出在 ${s.length} 字符处中断（未出现闭合标签）。已丢弃参数并重新发起该调用，请缩小单次调用的参数体积或分段写入。\n`;
+  return { name, text };
 }
 
 class ToolCallExtractor {
@@ -497,8 +498,14 @@ class ToolCallExtractor {
         for (const c of calls) events.push({ type: "tool_call", call: c });
         this.nextIndex += calls.length;
       } else if (this.pend.trim()) {
-        // 流在块中间结束：协议残片不回显原文，改为可执行的提示
-        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? toolCallNotice(this.pend, { closed: false }) : TC_OPEN + this.pend });
+        // 流在块中间结束：协议残片不回显原文，改为提示 + 空参数补发，避免 agent 循环被掐断
+        if (looksLikeProtocol(this.pend)) {
+          const fail = toolCallFailure(this.pend, { closed: false });
+          events.push({ type: "text", text: fail.text });
+          if (fail.name) events.push({ type: "tool_call", call: mkToolCall(fail.name, {}, this.nextIndex++) });
+        } else {
+          events.push({ type: "text", text: TC_OPEN + this.pend });
+        }
       }
       this.pend = ""; this.inCall = false;
     } else if (this.pend) {
@@ -540,15 +547,27 @@ class ToolCallExtractor {
           for (const c of calls) events.push({ type: "tool_call", call: c });
           this.nextIndex += calls.length;
         } else if (inner.trim()) {
-          // 解析不出结构化调用：协议残片只给提示，正常正文原样保留
-          events.push({ type: "text", text: looksLikeProtocol(inner) ? toolCallNotice(inner, { closed: true }) : TC_OPEN + inner + TC_CLOSE });
+          // 解析不出结构化调用：协议残片给提示并补发空参数调用（保证循环继续），正常正文原样保留
+          if (looksLikeProtocol(inner)) {
+            const fail = toolCallFailure(inner, { closed: true });
+            events.push({ type: "text", text: fail.text });
+            if (fail.name) events.push({ type: "tool_call", call: mkToolCall(fail.name, {}, this.nextIndex++) });
+          } else {
+            events.push({ type: "text", text: TC_OPEN + inner + TC_CLOSE });
+          }
         }
         continue;
       }
       // 防失控：缓冲超限且无闭合标签，放弃解析（协议残片只给提示）
       if (final || this.pend.length > 65536) {
         if (final) return events; // 交给 flush() 处理
-        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? toolCallNotice(this.pend, { closed: false }) : TC_OPEN + this.pend });
+        if (looksLikeProtocol(this.pend)) {
+          const fail = toolCallFailure(this.pend, { closed: false });
+          events.push({ type: "text", text: fail.text });
+          if (fail.name) events.push({ type: "tool_call", call: mkToolCall(fail.name, {}, this.nextIndex++) });
+        } else {
+          events.push({ type: "text", text: TC_OPEN + this.pend });
+        }
         this.pend = ""; this.inCall = false;
         return events;
       }
