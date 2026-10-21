@@ -157,5 +157,32 @@ console.log("\n=== 11. 提示语区分「解析失败」与「被截断」 ===")
   ok(!/输出在 \d+ 字符处中断，疑似达到上游单次输出长度上限/.test(unclosed), "不再武断归因于上游上限");
 }
 
+console.log("\n=== 12. 弯引号 “”（真实故障：模型用中文引号写 JSON） ===");
+{
+  const raw = '<tool_call>\n{"name": "CallDeferredTool", "arguments": {"tool_name": "ControlHub", "args": {"action": "evaluate", "domain": “browser”, "params": {"code": "document.title"}}}}\n</tool_call>';
+  const c = callsOf(run(raw));
+  ok(c.length === 1, "弯引号块可解析", `got ${c.length}`);
+  ok(c[0]?.function.name === "CallDeferredTool", "工具名正确", c[0]?.function.name);
+  const a = c[0] ? argsOf(c[0]) : {};
+  ok(a.args?.domain === "browser", "弯引号包裹的值被正确还原", JSON.stringify(a.args?.domain));
+  ok(a.tool_name === "ControlHub", "同块其它字段不受影响");
+}
+
+console.log("\n=== 13. 全角冒号/逗号 ===");
+{
+  const raw = '<tool_call>\n{"name"："Read", "arguments"：{"path"："/a.txt"}}\n</tool_call>';
+  const c = callsOf(run(raw));
+  ok(c.length === 1, "全角标点可解析", `got ${c.length}`);
+  ok(c[0] && argsOf(c[0]).path === "/a.txt", "参数正确");
+}
+
+console.log("\n=== 14. 正文里的中文引号不能被破坏 ===");
+{
+  const raw = '<tool_call>\n{"name": "Write", "arguments": {"file_path": "/a.txt", "payload": "他说“你好”然后走了"}}\n</tool_call>';
+  const c = callsOf(run(raw));
+  ok(c.length === 1, "仍可解析");
+  ok(c[0] && argsOf(c[0]).payload === "他说“你好”然后走了", "值内弯引号原样保留", JSON.stringify(c[0] ? argsOf(c[0]).payload : null));
+}
+
 console.log(`\n===== ${pass} 通过 / ${fail} 失败 =====`);
 process.exit(fail ? 1 : 0);

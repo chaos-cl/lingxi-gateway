@@ -257,6 +257,8 @@ export OPENAI_API_KEY=any
 
 - 跨 chunk 标签切断、未转义引号（shell 命令常见）、多余闭合标签
 - **宽松 JSON**：字符串里的裸换行 / Tab、尾随逗号（模型写多行代码时常见）
+- **中文标点修复**：模型会写出 `"domain": “browser”`（弯引号）或全角 `：，`，网关按"结构位置"判定后转成 ASCII，**不会破坏正文里的中文引号**
+- **失败留档**：解析失败的原始块自动存到 `data/failed-toolcalls/`（保留最近 20 份），事后可查究竟是哪种畸形
 - **畸形工具名归一**：模型会输出 `{"name": "tool_call", "arguments": {"name": "tools__Read", ...}}` 或 `tools__CallDeferredTool`，网关会剥掉包装层、去命名空间前缀、按本次请求的工具清单做大小写/后缀匹配，避免客户端报 `Tool 'xxx' is not in the allowed list`
 - **诊断提示区分两种失败**：块已闭合但不合法 → `[网关] 工具调用解析失败（工具名）…`；块没有闭合标签 → `[网关] 工具调用被截断（工具名）…`
 

@@ -219,6 +219,7 @@ function renderToolsPrompt(tools) {
     '<tool_call>\n{"name": "ExecCommand", "arguments": {"cmd": "grep \\"foo\\" file.txt"}}\n</tool_call>\n' +
     "工具执行结果将以 <tool_response> 块返回给你，根据结果继续回答或再次调用。\n" +
     "单次工具调用的参数体积请控制在 6000 字符以内：大文件先写骨架，再用 Edit 分段补全（上游单次输出长度有限，过长会被截断）。\n" +
+    "注意：JSON 的引号必须是半角 ASCII 双引号 \" ，不要用中文引号“”，冒号逗号也用半角 : , ，否则解析会失败。\n" +
     "若无需使用工具，直接用文字回答。"
   );
 }
@@ -362,11 +363,62 @@ function unwrapNested(c, depth = 0) {
   return unwrapNested({ name: nextName.trim(), args: nextArgs }, depth + 1);
 }
 
-/** JSON 客体/数组（含 shell 命令裸引号、裸换行、尾随逗号、包装层抢救） */
+/** 中文/排版引号（“ ” „ ″）→ ASCII 引号：只在结构位置转换，正文里的中文引号原样保留 */
+function repairSmartQuotes(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\u201c" || c === "\u201d" || c === "\u201e" || c === "\u2033") {
+      let p = i - 1;
+      while (p >= 0 && /\s/.test(s[p])) p--;
+      const prev = p >= 0 ? s[p] : "";
+      let n = i + 1;
+      while (n < s.length && /\s/.test(s[n])) n++;
+      const next = n < s.length ? s[n] : "";
+      const openCtx = prev === ":" || prev === "," || prev === "{" || prev === "[" || prev === "";
+      const closeCtx = next === "," || next === "}" || next === "]" || next === ":" || next === "";
+      if (openCtx || closeCtx) { out += '"'; continue; } // 当成字符串定界符
+    }
+    out += c; // 正文中的“引号”保留
+  }
+  return out;
+}
+
+/** 全角标点 → 半角（只在字符串外转换，结构位置的 ：，｛｝ 会让 JSON 直接失败） */
+function repairFullWidth(s) {
+  let out = "", inStr = false, esc = false;
+  for (const c of s) {
+    if (esc) { out += c; esc = false; continue; }
+    if (c === "\\") { out += c; esc = true; continue; }
+    if (c === '"') { inStr = !inStr; out += c; continue; }
+    if (!inStr) {
+      if (c === "\uff1a") { out += ":"; continue; }  // ：
+      if (c === "\uff0c") { out += ","; continue; }  // ，
+      if (c === "\uff5b") { out += "{"; continue; }  // ｛
+      if (c === "\uff5d") { out += "}"; continue; }  // ｝
+      if (c === "\uff1d") { out += "="; continue; }  // ＝
+    }
+    out += c;
+  }
+  return out;
+}
+
+/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 裸换行 / 尾逗号 / 未转义引号） */
 function parseJsonCalls(raw) {
   const tryParse = (s) => {
-    for (const attempt of [s, repairJsonLoose(s), repairUnescapedQuotes(s), repairUnescapedQuotes(repairJsonLoose(s))]) {
-      try { return JSON.parse(attempt); } catch { /* 继续尝试 */ }
+    const variants = [];
+    const add = (x) => { if (x != null && !variants.includes(x)) variants.push(x); };
+    add(s);
+    const sq = repairSmartQuotes(s);
+    add(sq);
+    const fw = repairFullWidth(sq);
+    add(fw);
+    const loose = repairJsonLoose(fw);
+    add(loose);
+    add(repairUnescapedQuotes(loose));
+    add(repairUnescapedQuotes(repairJsonLoose(s))); // 不走弯引号修复的兜底
+    for (const v of variants) {
+      try { return JSON.parse(v); } catch { /* 继续尝试 */ }
     }
     return null;
   };
@@ -406,6 +458,19 @@ function looksLikeProtocol(s) {
 /** 工具协议残片的诊断提示：区分「被截断」与「格式不合法」，各自给出可执行的纠正方式 */
 function toolCallNotice(inner, { closed = false } = {}) {
   const s = String(inner || "");
+  // 留档：解析失败的原始块写到 data/failed-toolcalls/（保留最近 20 份），便于事后定位是哪种畸形；
+  // 另可用 LINGXI_CAPTURE_DIR 指定目录。
+  const dumpDirs = [process.env.LINGXI_CAPTURE_DIR, path.join(DATA_SUBDIR, "failed-toolcalls")].filter(Boolean);
+  for (const dir of dumpDirs) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `failed-${Date.now()}.txt`);
+      fs.writeFileSync(file, s);
+      const old = fs.readdirSync(dir).filter((f) => /^failed-\d+\.txt$/.test(f)).sort().slice(0, -20);
+      for (const f of old) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ } }
+      break; // 成功一处即可
+    } catch { /* 忽略留档失败 */ }
+  }
   const name =
     (s.match(/<function\s*(?:=\s*|name\s*=\s*["'])([^"'>\s]+)/) || [])[1] ||
     (s.match(/<invoke\s+name\s*=\s*["']([^"']+)["']/) || [])[1] ||
