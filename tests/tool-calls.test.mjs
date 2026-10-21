@@ -125,5 +125,37 @@ console.log("\n=== 8. 多余闭合标签 / 普通正文不误判 ===");
   ok(callsOf(ev2).length === 0 && textOf(ev2).includes("arguments"), "正文含 arguments 原样保留");
 }
 
+console.log("\n=== 9. 包装层剥离（模型把 tool_call 当函数名） ===");
+{
+  const raw = '<tool_call>\n{"name": "tool_call", "arguments": {"name": "Read", "arguments": {"path": "/a.txt"}}}\n</tool_call>';
+  const c = callsOf(run(raw));
+  ok(c.length === 1, "产出 1 个调用");
+  ok(c[0]?.function.name === "Read", "嵌套层被剥开 → Read", c[0]?.function.name);
+  ok(c[0] && argsOf(c[0]).path === "/a.txt", "内层参数保留");
+
+  const raw2 = '<tool_call>\n{"name": "function", "arguments": {"tool_name": "ExecCommand", "params": {"cmd": "ls"}}}\n</tool_call>';
+  const c2 = callsOf(run(raw2));
+  ok(c2[0]?.function.name === "ExecCommand", "tool_name/params 变体也能剥开", c2[0]?.function.name);
+  ok(c2[0] && argsOf(c2[0]).cmd === "ls", "params 作为参数");
+}
+
+console.log("\n=== 10. 宽松 JSON 修复（裸换行 / 尾随逗号） ===");
+{
+  const raw = '<tool_call>\n{"name": "Write", "arguments": {"file_path": "/a.txt", "payload": "line1\nline2,\nline3",}}\n</tool_call>';
+  const c = callsOf(run(raw));
+  ok(c.length === 1, "裸换行+尾随逗号仍可解析", `got ${c.length}`);
+  const a = c[0] ? argsOf(c[0]) : {};
+  ok(a.payload === "line1\nline2,\nline3", "多行内容完整保留", JSON.stringify(a.payload));
+}
+
+console.log("\n=== 11. 提示语区分「解析失败」与「被截断」 ===");
+{
+  const closedBad = textOf(run('<tool_call>\n{"name": "Write", "arguments": {"payload": }}\n</tool_call>'));
+  ok(closedBad.includes("解析失败") && !closedBad.includes("被截断"), "已闭合但不合法 → 解析失败", closedBad.slice(0, 60));
+  const unclosed = textOf(run('<tool_call>\n{"name": "Write", "arguments": {"payload": "+++ /a\\n<div'));
+  ok(unclosed.includes("被截断"), "未闭合 → 被截断", unclosed.slice(0, 60));
+  ok(!/输出在 \d+ 字符处中断，疑似达到上游单次输出长度上限/.test(unclosed), "不再武断归因于上游上限");
+}
+
 console.log(`\n===== ${pass} 通过 / ${fail} 失败 =====`);
 process.exit(fail ? 1 : 0);

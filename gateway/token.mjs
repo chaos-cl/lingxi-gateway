@@ -11,16 +11,48 @@
  * 因此重铸不影响进行中的请求。
  */
 import { decryptDES } from "./des.mjs";
+import fs from "node:fs";
+import path from "node:path";
 
 const MINT_URL = "https://smsrebuild10.mail.10086.cn/file/disk";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 const REFRESH_AHEAD_MS = 24 * 3600 * 1000; // 过期前 1 天主动刷新
 
 export class TokenManager {
-  constructor({ sid, cookie }) {
+  /**
+   * @param {object} opts
+   * @param {string|null} [opts.cacheFile] Token 落盘路径。上游「铸造」要求 sid 对应的 cookie 足够新鲜
+   *   （cookie 会随浏览器会话轮换/过期，而铸出的 token 有 ~25 天有效期），所以必须把 token 存盘复用，
+   *   否则每次重启都要重新登录邮箱换凭据。
+   */
+  constructor({ sid, cookie, cacheFile = null }) {
     this.creds = { sid, cookie };
-    this.cache = null;
+    this.cacheFile = cacheFile;
+    this.cache = this._loadFromDisk();
     this.minting = null;
+  }
+
+  _loadFromDisk() {
+    if (!this.cacheFile) return null;
+    try {
+      const t = JSON.parse(fs.readFileSync(this.cacheFile, "utf8"));
+      if (!t?.basic || !t?.expiryMs) return null;
+      if (t.expiryMs - Date.now() <= REFRESH_AHEAD_MS) return null; // 快过期，直接重铸
+      return { ...t, fromDisk: true };
+    } catch { return null; }
+  }
+
+  _saveToDisk(t) {
+    if (!this.cacheFile || !t?.basic) return;
+    try {
+      fs.mkdirSync(path.dirname(this.cacheFile), { recursive: true });
+      fs.writeFileSync(this.cacheFile, JSON.stringify({ ...t, fromDisk: undefined, savedAt: new Date().toISOString() }, null, 1), { mode: 0o600 });
+    } catch { /* 落盘失败不影响本次使用 */ }
+  }
+
+  /** 是否有可用 token（含磁盘缓存，不触发网络） */
+  cachedToken() {
+    return this.cache && this.cache.expiryMs - Date.now() > REFRESH_AHEAD_MS ? this.cache : null;
   }
 
   updateCreds({ sid, cookie }) {
@@ -80,11 +112,18 @@ export class TokenManager {
 
   /** 取有效 token；并发调用共享同一次铸造 */
   async get(force = false) {
-    if (!force && this.cache && this.cache.expiryMs - Date.now() > REFRESH_AHEAD_MS) return this.cache;
+    if (!force && this.cache && this.cache.expiryMs - Date.now() > REFRESH_AHEAD_MS) {
+      if (this.cache.fromDisk && !this._loggedDisk) {
+        this._loggedDisk = true;
+        console.log(`[token] 复用磁盘缓存的 Token，有效期至 ${new Date(this.cache.expiryMs).toISOString()}（无需重新登录）`);
+      }
+      return this.cache;
+    }
     if (!this.minting) {
       this.minting = this.mint()
         .then((t) => {
           this.cache = t;
+          this._saveToDisk(t);
           const exp = t.expiryMs ? new Date(t.expiryMs).toISOString() : "未知";
           console.log(`[token] 铸造成功 ${t.phone.slice(0, 3)}****${t.phone.slice(-4)}，有效期至 ${exp}`);
           return t;
@@ -94,5 +133,9 @@ export class TokenManager {
     return this.minting;
   }
 
-  invalidate() { this.cache = null; }
+  invalidate() {
+    this.cache = null;
+    this._loggedDisk = false;
+    if (this.cacheFile) { try { fs.unlinkSync(this.cacheFile); } catch { /* 无文件即成功 */ } }
+  }
 }

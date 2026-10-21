@@ -135,8 +135,10 @@ node gateway/server.mjs
 
 | 凭据 | 有效期 | 网关处理 |
 |---|---|---|
-| RCS Token（Basic 认证用） | 约 25 天 | 到期前 1 天自动重铸；也可随时在控制台点「重铸 Token」 |
-| 邮箱会话（sid + cookie） | 约 30 天 | 过期后上游返回 `FA_INVALID_SESSION`，控制台会提示重新连接账号（回到方式 A/B/C） |
+| RCS Token（Basic 认证用） | 约 25 天 | **落盘缓存**在 `data/token.json`，到期前 1 天自动重铸；控制台也可手动「重铸 Token」 |
+| 邮箱会话（sid + cookie） | 浏览器会话级，会随会话轮换 | 只在**铸造 Token 那一刻**需要新鲜 cookie；过期后上游返回 `FA_INVALID_SESSION`，需重新连接账号（方式 A/B/C） |
+
+> **为什么 Token 要落盘**：铸造接口要求 sid 对应 cookie 是"新鲜"的（浏览器关掉/久不用就失效），而铸出来的 Token 有约 25 天有效期。网关把 Token 写进 `data/token.json` 复用，**因此重启网关/App 不需要重新登录**；只有在 Token 过期、或你换了账号时才需要回浏览器取一次 cookie。
 
 控制台「总览」页的 **Token 有效期倒计时** 可随时查看剩余时间。
 
@@ -251,7 +253,12 @@ export OPENAI_API_KEY=any
 | HERMES XML | `<tool_call><function=Read><parameter=path>/a.txt</parameter></function></tool_call>` |
 | invoke XML | `<tool_call><invoke name="Edit"><parameter name="file_path">…</parameter></tool_call>`（常缺 `</invoke>`） |
 
-同时处理了跨 chunk 标签切断、未转义引号（shell 命令常见）、多余闭合标签等边界情况。**若模型输出被上游长度上限截断**（大 `Write` 的 payload 过长时会发生），网关不会把半截协议吐给客户端，而是丢弃该调用并回一句 `[网关] 工具调用未完成（Write）…` 提示模型改用分段写入。
+同时处理了这些边界情况：
+
+- 跨 chunk 标签切断、未转义引号（shell 命令常见）、多余闭合标签
+- **宽松 JSON**：字符串里的裸换行 / Tab、尾随逗号（模型写多行代码时常见）
+- **畸形工具名归一**：模型会输出 `{"name": "tool_call", "arguments": {"name": "tools__Read", ...}}` 或 `tools__CallDeferredTool`，网关会剥掉包装层、去命名空间前缀、按本次请求的工具清单做大小写/后缀匹配，避免客户端报 `Tool 'xxx' is not in the allowed list`
+- **诊断提示区分两种失败**：块已闭合但不合法 → `[网关] 工具调用解析失败（工具名）…`；块没有闭合标签 → `[网关] 工具调用被截断（工具名）…`
 
 回归自测：`node tests/tool-calls.test.mjs`（28 项，样本取自真实会话日志）。
 
@@ -292,9 +299,24 @@ node tests/tool-calls.test.mjs
 </details>
 
 <details>
-<summary><b>正文出现「[网关] 工具调用未完成（Write）」</b></summary>
+<summary><b>正文出现「[网关] 工具调用解析失败 / 被截断」</b></summary>
 
-模型单次输出的体积撞到了上游长度上限，工具调用被截断（27K 字符级别的 `Write` payload 必然触发）。网关会丢弃半截调用并提示模型分段写，通常下一轮就会改成「先写骨架 → 再 Edit 追加」。若频繁出现，可在系统提示里进一步要求每次写入不超过 6000 字符。
+两种提示的含义不同：
+
+- **解析失败**：模型给出的块是完整的，但内容不是合法 JSON/XML（多为引号/换行没转义）。网关会回一句带工具名和开头片段的提示，模型下一轮通常会自己改对。
+- **被截断**：块没有收到 `</tool_call>`，流就结束了。
+
+**上游其实没有很小的输出上限**（实测，qwen3.8-Flash 单次响应）：
+
+| 场景 | 结果 |
+|---|---|
+| 连续数字 1..2000 | 8,898 字符，完整 |
+| 填充行 500 行 | 13,397 字符，完整 |
+| 填充行 1500 行 | **40,898 字符，完整** |
+| `Write` 工具单次 payload（400 行 HTML/CSS） | **11,360 字符，完整落盘** |
+| 要求 2500 行 | 只写 100 行就自停（`finish=stop`，模型自行收尾，非截断） |
+
+即：真实发生过的大 payload 截断属于偶发（长流中途断），不是固定字符上限。若频繁出现，再考虑在系统提示里要求每次写入 ≤6000 字符、分段追加。
 </details>
 
 <details>

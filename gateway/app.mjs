@@ -87,7 +87,12 @@ export function createGateway(opts = {}) {
     ...(opts.port ? { port: Number(opts.port) } : {}),
   };
 
-  const tokens = new TokenManager({ sid: creds.sid || config.sid, cookie: creds.cookie || config.cookie });
+  // Token 落盘复用：铸造要求 cookie 新鲜、token 却有 ~25 天有效期，存盘后重启无需重新登录
+  const tokens = new TokenManager({
+    sid: creds.sid || config.sid,
+    cookie: creds.cookie || config.cookie,
+    cacheFile: path.join(DATA_SUBDIR, "token.json"),
+  });
   const upstream = new Upstream(tokens);
 
   const log = (line) => {
@@ -324,12 +329,46 @@ function parseInvokeCalls(raw) {
   return out.filter((c) => c.name);
 }
 
-/** JSON 客体/数组（含 shell 命令裸引号抢救） */
+/** 修掉字符串里的裸换行/Tab 与尾随逗号——模型写多行代码时常犯 */
+function repairJsonLoose(s) {
+  let out = "", inStr = false, esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { out += c; esc = false; continue; }
+    if (c === "\\") { out += c; esc = true; continue; }
+    if (c === '"') { inStr = !inStr; out += c; continue; }
+    if (inStr) {
+      if (c === "\n") { out += "\\n"; continue; }
+      if (c === "\r") continue;
+      if (c === "\t") { out += "\\t"; continue; }
+    }
+    out += c;
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
+/** 把 {"name":"tool_call","arguments":{"name":"Read","arguments":{...}}} 这类包装层剥开 */
+function unwrapNested(c, depth = 0) {
+  const WRAPPER = /^(tool_calls?|tools?|functions?|invoke|call|arguments|parameters)$/i;
+  if (depth > 3 || !WRAPPER.test(c.name)) return c;
+  const a = c.args;
+  if (!a || typeof a !== "object") return c;
+  const nextName = a.name ?? a.tool_name ?? a.toolName ?? a.function ?? a.tool;
+  if (typeof nextName !== "string" || !nextName.trim()) return c;
+  let nextArgs = a.arguments ?? a.parameters ?? a.params ?? a.args ?? a.input ?? {};
+  if (typeof nextArgs === "string") {
+    try { nextArgs = JSON.parse(nextArgs); } catch { try { nextArgs = JSON.parse(repairJsonLoose(nextArgs)); } catch { /* 保持原样 */ } }
+  }
+  return unwrapNested({ name: nextName.trim(), args: nextArgs }, depth + 1);
+}
+
+/** JSON 客体/数组（含 shell 命令裸引号、裸换行、尾随逗号、包装层抢救） */
 function parseJsonCalls(raw) {
   const tryParse = (s) => {
-    try { return JSON.parse(s); } catch {
-      try { return JSON.parse(repairUnescapedQuotes(s)); } catch { return null; }
+    for (const attempt of [s, repairJsonLoose(s), repairUnescapedQuotes(s), repairUnescapedQuotes(repairJsonLoose(s))]) {
+      try { return JSON.parse(attempt); } catch { /* 继续尝试 */ }
     }
+    return null;
   };
   let obj = tryParse(raw);
   if (!obj) {
@@ -344,7 +383,7 @@ function parseJsonCalls(raw) {
     if (!name || typeof name !== "string") continue;
     let args = it.arguments ?? it.function?.arguments ?? it.parameters ?? it.args ?? {};
     if (typeof args === "string") { const p = tryParse(args); if (p) args = p; }
-    out.push({ name, args });
+    out.push(unwrapNested({ name: name.trim(), args }));
   }
   return out;
 }
@@ -364,14 +403,19 @@ function looksLikeProtocol(s) {
   return /<function\s*=|<\/function>|<parameter\s*=|<\/parameter>|<invoke\s|"arguments"\s*:/.test(String(s || ""));
 }
 
-/** 截断/不可解析块的提示：认出工具名并给出可执行的纠正建议（替代把原始协议泄漏给用户） */
-function truncatedNotice(inner) {
-  const raw = String(inner || "");
+/** 工具协议残片的诊断提示：区分「被截断」与「格式不合法」，各自给出可执行的纠正方式 */
+function toolCallNotice(inner, { closed = false } = {}) {
+  const s = String(inner || "");
   const name =
-    (raw.match(/<function\s*(?:=\s*|name\s*=\s*["'])([^"'>\s]+)/) || [])[1] ||
-    (raw.match(/<invoke\s+name\s*=\s*["']([^"']+)["']/) || [])[1] ||
-    (raw.match(/"name"\s*:\s*"([^"]+)"/) || [])[1] || "";
-  return `\n[网关] 工具调用未完成${name ? `（${name}）` : ""}：输出在 ${raw.length} 字符处中断，疑似达到上游单次输出长度上限，该调用已丢弃。请把大文件拆成多次较小写入（先写骨架，再用 Edit 分段追加），或缩小单次改动范围。\n`;
+    (s.match(/<function\s*(?:=\s*|name\s*=\s*["'])([^"'>\s]+)/) || [])[1] ||
+    (s.match(/<invoke\s+name\s*=\s*["']([^"']+)["']/) || [])[1] ||
+    (s.match(/"name"\s*:\s*"([^"]+)"/) || [])[1] || "";
+  const who = name ? `（${name}）` : "";
+  if (closed) {
+    const head = s.trim().replace(/\s+/g, " ").slice(0, 120);
+    return `\n[网关] 工具调用解析失败${who}：该块 ${s.length} 字符，但不是合法的 JSON/XML，已丢弃。请用 {"name": "工具名", "arguments": {...}}，字符串内的引号与换行必须转义。开头片段：${head}\n`;
+  }
+  return `\n[网关] 工具调用被截断${who}：输出在 ${s.length} 字符处中断（未出现闭合标签），已丢弃该调用。请缩小单次调用的参数体积，或改为分段写入。\n`;
 }
 
 class ToolCallExtractor {
@@ -389,7 +433,7 @@ class ToolCallExtractor {
         this.nextIndex += calls.length;
       } else if (this.pend.trim()) {
         // 流在块中间结束：协议残片不回显原文，改为可执行的提示
-        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? truncatedNotice(this.pend) : TC_OPEN + this.pend });
+        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? toolCallNotice(this.pend, { closed: false }) : TC_OPEN + this.pend });
       }
       this.pend = ""; this.inCall = false;
     } else if (this.pend) {
@@ -432,14 +476,14 @@ class ToolCallExtractor {
           this.nextIndex += calls.length;
         } else if (inner.trim()) {
           // 解析不出结构化调用：协议残片只给提示，正常正文原样保留
-          events.push({ type: "text", text: looksLikeProtocol(inner) ? truncatedNotice(inner) : TC_OPEN + inner + TC_CLOSE });
+          events.push({ type: "text", text: looksLikeProtocol(inner) ? toolCallNotice(inner, { closed: true }) : TC_OPEN + inner + TC_CLOSE });
         }
         continue;
       }
       // 防失控：缓冲超限且无闭合标签，放弃解析（协议残片只给提示）
       if (final || this.pend.length > 65536) {
         if (final) return events; // 交给 flush() 处理
-        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? truncatedNotice(this.pend) : TC_OPEN + this.pend });
+        events.push({ type: "text", text: looksLikeProtocol(this.pend) ? toolCallNotice(this.pend, { closed: false }) : TC_OPEN + this.pend });
         this.pend = ""; this.inCall = false;
         return events;
       }
@@ -558,6 +602,32 @@ async function handleChat(req, res, body, deps) {
     return oaiError(res, e.status || 400, e.message);
   }
 
+  // 模型常给工具名加命名空间前缀或直接吐包装名（tools__CallDeferredTool / tool_call / functions.Read），
+  // 这里按本次请求实际提供的工具清单做归一，避免客户端报 "Tool 'xxx' is not in the allowed list"。
+  const allowedTools = tools.map((t) => t?.function?.name).filter((n) => typeof n === "string" && n);
+  const allowedLower = new Map(allowedTools.map((n) => [n.toLowerCase(), n]));
+  const normalizeToolCall = (call) => {
+    const fn = call?.function;
+    if (!fn) return null;
+    let name = String(fn.name || "").trim();
+    if (!name) return null;
+    if (!allowedTools.length || allowedTools.includes(name)) return call;
+    const candidates = [
+      name.replace(/^(?:tools?|functions?)__/i, ""),           // tools__CallDeferredTool → CallDeferredTool
+      name.split(/[.:/]/).pop(),                                // functions.Read → Read
+      name.replace(/^(?:tools?|functions?)[._-]/i, ""),
+    ];
+    for (const c of candidates) {
+      if (!c) continue;
+      if (allowedTools.includes(c)) { fn.name = c; return call; }
+      const hit = allowedLower.get(c.toLowerCase());
+      if (hit) { fn.name = hit; return call; }
+    }
+    const tail = allowedTools.find((t) => t.toLowerCase().endsWith(name.split(/[.:/]/).pop().toLowerCase()));
+    if (tail) { fn.name = tail; return call; }
+    return call; // 未命中就原样放行，让客户端明确报错而不是静默丢调用
+  };
+
   // 缓存命中估算（前缀复用）：必须在本轮调用前算，并把本轮 prompt 记为下轮基准。
   // 可缓存前缀 < 1024 token 时百炼不会建立缓存 → 上报 0，避免假命中。
   const cachePrefixTokens = config.cacheEstimate === false
@@ -612,9 +682,21 @@ async function handleChat(req, res, body, deps) {
   const usageSource = "estimated"; // 上游不返回计量，token 与缓存命中均为估算（见 README「token 用量与缓存命中」）
   let content = "", reasoning = "", modelUsed = "", sidOut = "", statement = "", citations = [];
   let toolCallCount = 0;
+  let lastFinish = "";
   // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
   const finalize = () => {
     log(`[chat] ${modelObj.name}${think ? "+think" : ""}${webSearch ? "+search" : ""}${toolCallCount ? "+tools(" + toolCallCount + ")" : ""} | ${sessionId ? "续会话" : "新会话"} ${sidOut || ""} | ${content.length}字${cacheTokens ? " 缓存≈" + cacheTokens + "tok" : ""} ${Date.now() - t0}ms`);
+    // 原始抓包（排查上游截断/畸形输出用）：LINGXI_CAPTURE_DIR=/path 打开
+    if (process.env.LINGXI_CAPTURE_DIR) {
+      try {
+        fs.mkdirSync(process.env.LINGXI_CAPTURE_DIR, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        fs.writeFileSync(
+          path.join(process.env.LINGXI_CAPTURE_DIR, `${stamp}-${id}.json`),
+          JSON.stringify({ ts: new Date().toISOString(), id, model: modelObj.id, think: !!think, tools: allowedTools, promptChars, contentChars: content.length, reasoningChars: reasoning.length, finishReason: lastFinish, elapsedMs: Date.now() - t0, out: content, reasoning }, null, 1)
+        );
+      } catch (e) { log(`[capture] 写盘失败: ${e.message}`); }
+    }
     recordUsage({
       model: modelObj.id, modelName: modelObj.name, think: !!think, search: !!webSearch,
       ok: true, promptChars, contentChars: content.length, reasoningChars: reasoning.length,
@@ -640,7 +722,7 @@ async function handleChat(req, res, body, deps) {
         const extractor = new ToolCallExtractor();
         const events = [...extractor.feed(content), ...extractor.flush()];
         content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
-        toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => e.call);
+        toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
         toolCallCount = toolCallsOut.length;
       }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", ...(sidOut ? { "x-139-session-id": sidOut } : {}) });
@@ -678,9 +760,11 @@ async function handleChat(req, res, body, deps) {
         if (e.type === "text" && e.text) {
           res.write(`data: ${JSON.stringify(baseChunk({ content: e.text }))}\n\n`);
         } else if (e.type === "tool_call") {
+          const call = normalizeToolCall(e.call);
+          if (!call) continue;
           sawToolCall = true;
           toolCallCount++;
-          res.write(`data: ${JSON.stringify(baseChunk({ tool_calls: [e.call] }))}\n\n`);
+          res.write(`data: ${JSON.stringify(baseChunk({ tool_calls: [call] }))}\n\n`);
         }
       }
     };
@@ -754,6 +838,7 @@ async function handleChat(req, res, body, deps) {
     const fr = d.flowResult || {};
     if (fr.outContent) content += fr.outContent;
     if (fr.reasoningContent) reasoning += fr.reasoningContent;
+    if (fr.finishReason) lastFinish = fr.finishReason;
     if (fr.modelType) modelUsed = fr.modelType;
     if (d.responseStatement) statement = d.responseStatement;
     if (!citations.length && fr.networkSearchInfoList?.length) {
