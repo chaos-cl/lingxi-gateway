@@ -37,6 +37,19 @@
   header.page{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:18px}
   header.page h1{margin:0;font-size:20px;letter-spacing:.2px}
   header.page p{margin:5px 0 0;color:var(--muted);font-size:12.5px}
+  /* ---------- Electron 桌面窗口（macOS 隐藏标题栏）：顶部空白可拖动窗口 ---------- */
+  html.mac-desktop aside{padding-top:38px;-webkit-app-region:drag}  /* 让出交通灯，整条侧栏可拖 */
+  html.mac-desktop nav a,
+  html.mac-desktop .side-foot{-webkit-app-region:no-drag}          /* 侧栏内可点区域 */
+  html.mac-desktop .brand,
+  html.mac-desktop header.page{-webkit-app-region:drag;user-select:none}
+  html.mac-desktop button,
+  html.mac-desktop a,
+  html.mac-desktop input,
+  html.mac-desktop select,
+  html.mac-desktop textarea,
+  html.mac-desktop label,
+  html.mac-desktop .no-drag{-webkit-app-region:no-drag}
   .btn{border:1px solid var(--line);background:var(--card-2);color:var(--text);padding:8px 14px;border-radius:10px;cursor:pointer;font-weight:600;font-size:13px;transition:.15s;display:inline-flex;align-items:center;gap:7px}
   .btn:hover{background:#233257;border-color:#33507f}
   .btn.primary{background:linear-gradient(135deg,var(--brand),#2563eb);border-color:transparent;box-shadow:0 6px 18px rgba(37,99,235,.32)}
@@ -306,6 +319,10 @@
 
 <script>
 const TOKEN = "__ADMIN_TOKEN__";
+// macOS 桌面窗口用 hiddenInset 隐藏标题栏，需自行提供拖动区域（否则整窗无法拖动）
+if (window.lingxiDesktop?.isDesktop && window.lingxiDesktop.platform === "darwin") {
+  document.documentElement.classList.add("mac-desktop");
+}
 const $ = (s) => document.querySelector(s);
 const fmtN = (n) => (n ?? 0).toLocaleString("zh-CN");
 const fmtTok = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n ?? 0);

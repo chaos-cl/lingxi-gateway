@@ -249,6 +249,11 @@ function createMainWindow() {
           out.usageRows = document.querySelectorAll('#miniModels tr').length;
           out.bars = document.querySelectorAll('#miniBars .bar').length;
           out.activeTab = document.querySelector('nav a.active')?.textContent?.trim();
+          // 窗口拖动区自检：macOS 隐藏标题栏时必须存在 drag 区域，否则整个窗口拖不动
+          const reg = (sel) => { const el = document.querySelector(sel); return el ? (getComputedStyle(el).webkitAppRegion || "-") : "missing"; };
+          out.dragRegion = { brand: reg(".brand"), header: reg("#s-overview header.page"), aside: reg("aside"), navLink: reg("nav a"), sideFoot: reg(".side-foot") };
+          out.macClass = document.documentElement.classList.contains("mac-desktop");
+          out.platform = window.lingxiDesktop?.platform;
           return out;
         })()`);
         pushLog("[自检] " + JSON.stringify(diag));
