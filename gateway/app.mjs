@@ -507,7 +507,66 @@ function toolCallFailure(inner, { closed = false } = {}) {
 }
 
 class ToolCallExtractor {
-  constructor() { this.pend = ""; this.inCall = false; this.nextIndex = 0; }
+  /** @param {string[]|null} allowedNames 本次请求提供的工具名；给了才启用裸 JSON 识别（避免误吃正文） */
+  constructor(allowedNames = null) {
+    this.pend = ""; this.inCall = false; this.nextIndex = 0;
+    this.allowed = Array.isArray(allowedNames) && allowedNames.length ? allowedNames : null;
+  }
+  /** 名字是否属于本次请求的工具（容忍 tools__ 前缀与大小写） */
+  _nameOk(name) {
+    if (!this.allowed) return false;
+    const n = String(name || "").trim();
+    if (!n) return false;
+    const short = n.replace(/^(?:tools?|functions?)__/i, "").split(/[.:/]/).pop();
+    return this.allowed.some((a) => a === n || a === short || a.toLowerCase() === short.toLowerCase());
+  }
+  /** 尝试把缓冲里的裸 JSON 当作工具调用；返回 { events, consumed } 或 null（需等待更多数据） */
+  _tryBareJson(final) {
+    if (!this.allowed) return null;
+    const m = BARE_JSON_RE.exec(this.pend);
+    if (!m) return null;
+    const start = m.index;
+    const end = scanBalancedJson(this.pend, start);
+    if (end < 0) {
+      // 未闭合：可能还在流里；超过 64KB 说明不是调用，放弃识别
+      if (!final && this.pend.length - start <= 65536) return { events: [], consumed: 0, wait: true };
+      if (final) {
+        // 流已结束仍不闭合 → 按"少右括号/被截断"处理：能补全就补，补不出就给空参数补发
+        const tailRaw = this.pend.slice(start);
+        const closed = autoCloseJson(repairSmartQuotes(tailRaw));
+        const fixed = closed ? parseToolCallBlock(closed, this.nextIndex) : [];
+        const events2 = [];
+        const before2 = this.pend.slice(0, start).replace(/```(?:json)?\s*$/i, "");
+        if (before2) events2.push({ type: "text", text: before2 });
+        if (fixed.length && fixed.every((c) => this._nameOk(c.function.name))) {
+          for (const c of fixed) events2.push({ type: "tool_call", call: c });
+          this.nextIndex += fixed.length;
+        } else {
+          const nameM = tailRaw.match(/"name"\s*:\s*["“”']([^"“”'\s]+)/);
+          const fail = toolCallFailure(tailRaw, { closed: false });
+          events2.push({ type: "text", text: fail.text });
+          if (nameM && this._nameOk(nameM[1])) events2.push({ type: "tool_call", call: mkToolCall(nameM[1], {}, this.nextIndex++) });
+        }
+        return { events: events2, consumed: this.pend.length, wait: false };
+      }
+      return null;
+    }
+    const events = [];
+    const before = this.pend.slice(0, start).replace(/```(?:json)?\s*$/i, "");
+    if (before) events.push({ type: "text", text: before });
+    const candidate = this.pend.slice(start, end);
+    const calls = parseToolCallBlock(candidate, this.nextIndex);
+    if (calls.length && calls.every((c) => this._nameOk(c.function.name))) {
+      for (const c of calls) events.push({ type: "tool_call", call: c });
+      this.nextIndex += calls.length;
+      let rest = this.pend.slice(end);
+      rest = rest.replace(/^\s*```/, ""); // 被 ```json 包裹时去掉收尾围栏
+      return { events, consumed: end + (this.pend.slice(end).length - rest.length), wait: false };
+    }
+    // 不像工具调用 → 当正文原样吐出这段，继续往后扫
+    events.push({ type: "text", text: candidate });
+    return { events, consumed: end, wait: false };
+  }
   feed(chunk) {
     this.pend += chunk;
     return this._drain();
@@ -550,8 +609,28 @@ class ToolCallExtractor {
           this.inCall = true;
           continue;
         }
-        // 无开标签：保留可能是半截标签（开/闭任一）的尾部，其余正文剥掉孤立闭合标签后输出
-        const keep = final ? 0 : Math.max(tagOverlap(this.pend, TC_OPEN), tagOverlap(this.pend, TC_CLOSE));
+        // 裸 JSON：模型偶尔不加 <tool_call>，直接把 {"name": "工具名", "arguments": {...}} 当正文吐出来
+        const bare = this._tryBareJson(final);
+        if (bare && bare.wait) {
+          const bm = BARE_JSON_RE.exec(this.pend);
+          const before = this.pend.slice(0, bm.index).replace(STRAY_CLOSE_RE, "");
+          if (before) events.push({ type: "text", text: before });
+          this.pend = this.pend.slice(bm.index);
+          return events; // 等更多数据（可能是被切断的裸调用）
+        }
+        if (bare) {
+          for (const e of bare.events) events.push(e);
+          this.pend = this.pend.slice(bare.consumed);
+          continue;
+        }
+        // 无开标签：保留半截标签、以及可能是裸 JSON 开头的尾巴（否则 '{"name"...' 的首个 '{' 会被当正文吐掉）
+        let keep = final ? 0 : Math.max(tagOverlap(this.pend, TC_OPEN), tagOverlap(this.pend, TC_CLOSE));
+        if (!final && this.allowed) {
+          const lb = this.pend.lastIndexOf("{");
+          if (lb >= 0 && this.pend.length - lb <= 40 && !this.pend.slice(lb).includes("}")) {
+            keep = Math.max(keep, this.pend.length - lb);
+          }
+        }
         const body = this.pend.slice(0, this.pend.length - keep);
         const tail = this.pend.slice(this.pend.length - keep);
         const cleaned = body.replace(STRAY_CLOSE_RE, "");
@@ -597,6 +676,26 @@ class ToolCallExtractor {
     }
   }
 }
+
+/**
+ * 从 start 处的 '{' 开始找配对的 '}'（跳过字符串内容）。返回结束下标（含），未闭合返回 -1。
+ */
+function scanBalancedJson(s, start) {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { esc = false; continue; }
+    if (c === "\\") { esc = true; continue; }
+    if (inStr) { if (c === '"') inStr = false; continue; }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) return i + 1; }
+  }
+  return -1;
+}
+
+/** 裸 JSON 工具调用的起始特征（模型偶尔不加 <tool_call> 直接吐 JSON） */
+const BARE_JSON_RE = /\{\s*"(?:name|tool_name|tool_calls|function)"\s*:/;
 
 /**
  * <thinking>/<thought>/<reasoning> 块拆分器：模型偶尔把思考写进正文（而不是 reasoningContent）。
@@ -885,7 +984,7 @@ async function handleChat(req, res, body, deps) {
         // 工具调用提取（非流式）：从全文中提取 <tool_call> 块转为结构化 tool_calls
         toolCallsOut = [];
         if (tools.length) {
-          const extractor = new ToolCallExtractor();
+          const extractor = new ToolCallExtractor(allowedTools);
           const events = [...extractor.feed(content), ...extractor.flush()];
           content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
           toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
@@ -926,7 +1025,7 @@ async function handleChat(req, res, body, deps) {
     res.write(`data: ${JSON.stringify(baseChunk({ role: "assistant", content: "" }))}\n\n`);
 
     // 工具调用提取（流式）：正文经 ToolCallExtractor，<tool_call> 块转结构化 delta.tool_calls
-    const extractor = tools.length ? new ToolCallExtractor() : null;
+    const extractor = tools.length ? new ToolCallExtractor(allowedTools) : null;
     let sawToolCall = false;
     const emitTextEvents = (events) => {
       for (const e of events) {

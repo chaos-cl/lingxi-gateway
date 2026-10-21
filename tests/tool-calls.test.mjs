@@ -25,6 +25,7 @@ const ok = (cond, msg, extra = "") => {
 const callsOf = (events) => events.filter((e) => e.type === "tool_call").map((e) => e.call);
 const textOf = (events) => events.filter((e) => e.type === "text").map((e) => e.text).join("");
 const argsOf = (c) => JSON.parse(c.function.arguments);
+const c0 = (ev) => JSON.stringify(ev.filter((e) => e.type === "tool_call").map((e) => e.call.function.name));
 
 function run(raw, chunkSize = 0) {
   const ex = new ToolCallExtractor();
@@ -214,6 +215,38 @@ console.log("\n=== 17. 字符串未闭合（真截断）不得补全 ===");
   const raw = '<tool_call>\n{"name": "Write", "arguments": {"payload": "+++ /a.html\\n<div class=\\"x';
   const c = callsOf(run(raw));
   ok(c.length === 1 && c[0].function.arguments === "{}", "只补发空参数调用，不伪造半截内容", c[0]?.function.arguments);
+}
+
+console.log("\n=== 18. 裸 JSON（模型不加 <tool_call> 直接吐 JSON，线上真实形态） ===");
+{
+  const allowed = ["ExecCommand", "Write", "Read"];
+  const bare = '{"name": "ExecCommand", "arguments": {"cmd": "cd /tmp && curl -s -o /dev/null -w \'http=%{http_code}\\n\' http://127.0.0.1:8010/", "workdir": "/tmp", "yield_time_ms": 30000}}';
+  const runAllowed = (raw, chunk = 0) => {
+    const ex = new ToolCallExtractor(allowed);
+    const out = [];
+    if (chunk > 0) { for (let i = 0; i < raw.length; i += chunk) out.push(...ex.feed(raw.slice(i, i + chunk))); }
+    else out.push(...ex.feed(raw));
+    out.push(...ex.flush());
+    return out;
+  };
+  const ev = runAllowed("先说一句。\n" + bare);
+  ok(callsOf(ev).length === 1 && callsOf(ev)[0].function.name === "ExecCommand", "裸 JSON 被识别为工具调用", c0(ev));
+  ok(argsOf(callsOf(ev)[0]).cmd.includes("http_code"), "参数完整（含 %{} 与引号）");
+  ok(textOf(ev) === "先说一句。\n", "前面的正文保留、JSON 不残留", JSON.stringify(textOf(ev)));
+
+  const evChunk = runAllowed("先说一句。\n" + bare, 5);
+  ok(callsOf(evChunk).length === 1, "5 字符切片下仍识别（流式边界）", c0(evChunk));
+  ok(textOf(evChunk) === "先说一句。\n", "切片下正文也不残留", JSON.stringify(textOf(evChunk)));
+
+  const evFence = runAllowed("```json\n" + bare + "\n```");
+  ok(callsOf(evFence).length === 1, "被 ```json 围栏包裹也能识别", c0(evFence));
+
+  const evUnknown = runAllowed('代码示例：{"name": "不存在的工具", "arguments": {}} 就是这样。');
+  ok(callsOf(evUnknown).length === 0, "工具名不在本次清单 → 当正文，不误吃");
+  ok(textOf(evUnknown).includes("不存在的工具"), "正文内容完整保留");
+
+  const evTrunc = runAllowed('{"name": "ExecCommand", "arguments": {"cmd": "ls -la /tmp"}');
+  ok(callsOf(evTrunc).length === 1 && argsOf(callsOf(evTrunc)[0]).cmd === "ls -la /tmp", "裸 JSON 少右括号也能补全");
 }
 
 console.log(`\n===== ${pass} 通过 / ${fail} 失败 =====`);
