@@ -403,7 +403,28 @@ function repairFullWidth(s) {
   return out;
 }
 
-/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 裸换行 / 尾逗号 / 未转义引号） */
+/**
+ * 结构性补全：字符串都已闭合、只差少量 } / ]（模型常少写一个右括号）。
+ * 超过 3 层或字符串本身没闭合（=真截断，payload 不完整）则拒绝，避免写坏文件。
+ */
+function autoCloseJson(s) {
+  let inStr = false, esc = false;
+  const depth = [];
+  for (const c of s) {
+    if (esc) { esc = false; continue; }
+    if (c === "\\") { esc = true; continue; }
+    if (inStr) { if (c === '"') inStr = false; continue; }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{" || c === "[") depth.push(c);
+    else if (c === "}" || c === "]") depth.pop();
+  }
+  if (inStr || esc || !depth.length || depth.length > 3) return null;
+  let out = s.replace(/[,\s]+$/, "");
+  for (let i = depth.length - 1; i >= 0; i--) out += depth[i] === "{" ? "}" : "]";
+  return out;
+}
+
+/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 裸换行 / 尾逗号 / 未转义引号 / 结构补全） */
 function parseJsonCalls(raw) {
   const tryParse = (s) => {
     const variants = [];
@@ -417,6 +438,7 @@ function parseJsonCalls(raw) {
     add(loose);
     add(repairUnescapedQuotes(loose));
     add(repairUnescapedQuotes(repairJsonLoose(s))); // 不走弯引号修复的兜底
+    add(autoCloseJson(loose));                       // 只差右括号：补全后通常能拿到完整参数
     for (const v of variants) {
       try { return JSON.parse(v); } catch { /* 继续尝试 */ }
     }
@@ -576,9 +598,60 @@ class ToolCallExtractor {
   }
 }
 
+/**
+ * <thinking>/<thought>/<reasoning> 块拆分器：模型偶尔把思考写进正文（而不是 reasoningContent）。
+ * 拆出来映射到 reasoning_content，正文才干净；未闭合时标记 unfinishedThinking，
+ * 供上层判断"这轮只吐了半截思考"从而自动续写。
+ */
+const THINK_TAGS = ["thinking", "thought", "reasoning"];
+class ThinkingSplitter {
+  constructor() { this.buf = ""; this.inThink = false; this.tag = ""; this.unfinishedThinking = false; }
+  feed(chunk) { this.buf += chunk; return this._drain(false); }
+  flush() { const ev = this._drain(true); this.unfinishedThinking = this.inThink; return ev; }
+  reset() { this.buf = ""; this.inThink = false; this.tag = ""; } // 换一轮上游请求时重置，避免沿用上一轮的未闭合状态
+  _drain(final) {
+    const events = [];
+    while (this.buf) {
+      if (!this.inThink) {
+        let best = null;
+        for (const t of THINK_TAGS) {
+          const i = this.buf.toLowerCase().indexOf(`<${t}>`);
+          if (i >= 0 && (!best || i < best.i)) best = { i, t };
+        }
+        if (best) {
+          const before = this.buf.slice(0, best.i);
+          if (before) events.push({ type: "content", text: before });
+          this.buf = this.buf.slice(best.i + best.t.length + 2);
+          this.inThink = true; this.tag = best.t;
+          continue;
+        }
+        const keep = final ? 0 : Math.max(0, ...THINK_TAGS.map((t) => tagOverlap(this.buf, `<${t}>`)));
+        const body = this.buf.slice(0, this.buf.length - keep);
+        if (body) events.push({ type: "content", text: body });
+        this.buf = this.buf.slice(this.buf.length - keep);
+        return events;
+      }
+      const close = `</${this.tag}>`;
+      const i = this.buf.toLowerCase().indexOf(close);
+      if (i >= 0) {
+        const inner = this.buf.slice(0, i);
+        if (inner) events.push({ type: "reasoning", text: inner });
+        this.buf = this.buf.slice(i + close.length);
+        this.inThink = false; this.tag = "";
+        continue;
+      }
+      events.push({ type: "reasoning", text: this.buf }); // 未闭合也先吐（保持流式）
+      this.buf = "";
+      return events;
+    }
+    return events;
+  }
+}
+
 // 供离线回归测试使用（真实模型输出样本 → 结构化调用）
 __internals.parseToolCallBlock = parseToolCallBlock;
 __internals.ToolCallExtractor = ToolCallExtractor;
+__internals.ThinkingSplitter = ThinkingSplitter;
 
 function lastUserText(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -792,23 +865,39 @@ async function handleChat(req, res, body, deps) {
   const baseChunk = (delta, extra = {}) => ({
     id, object: "chat.completion.chunk", created, model: modelObj.id, choices: [{ index: 0, delta, finish_reason: null, ...extra }],
   });
+  // 上游偶尔只吐半截思考就停（finishReason=stop 却戛然而止）；此时追加此提示重试一次
+  const NUDGE_TEXT = "\n\n（系统提示：你上一条回复只有思考、没有实际输出。请继续完成任务；若还需要操作，请立即发起工具调用。）";
 
   try {
     if (!stream) {
-      for await (const ev of upstream.chat(chatOpts)) {
-        collect(ev);
-        armIdle();
+      let toolCallsOut = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const opts = attempt === 0 ? chatOpts : { ...chatOpts, dialogue: dialogue + NUDGE_TEXT };
+        for await (const ev of upstream.chat(opts)) {
+          collect(ev);
+          armIdle();
+        }
+        // 把写进正文的 <thinking> 拆到 reasoning，正文才算"真输出"
+        const sp = new ThinkingSplitter();
+        const spell = [...sp.feed(content), ...sp.flush()];
+        content = spell.filter((e) => e.type === "content").map((e) => e.text).join("");
+        reasoning += spell.filter((e) => e.type === "reasoning").map((e) => e.text).join("");
+        // 工具调用提取（非流式）：从全文中提取 <tool_call> 块转为结构化 tool_calls
+        toolCallsOut = [];
+        if (tools.length) {
+          const extractor = new ToolCallExtractor();
+          const events = [...extractor.feed(content), ...extractor.flush()];
+          content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
+          toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
+          toolCallCount = toolCallsOut.length;
+        }
+        // 只吐出思考 / 什么都没吐，且本可以用工具 → 续写一次，避免 agent 轮次被掐断
+        const produced = content.trim() || toolCallsOut.length;
+        if (produced || !tools.length || attempt === 1) break;
+        log("[chat] 空回复（只有思考），自动续写一次");
+        content = "";
       }
       clearTimers();
-      // 工具调用提取（非流式）：从全文中提取 <tool_call> 块转为结构化 tool_calls
-      let toolCallsOut = [];
-      if (tools.length) {
-        const extractor = new ToolCallExtractor();
-        const events = [...extractor.feed(content), ...extractor.flush()];
-        content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
-        toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
-        toolCallCount = toolCallsOut.length;
-      }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", ...(sidOut ? { "x-139-session-id": sidOut } : {}) });
       res.end(JSON.stringify({
         id, object: "chat.completion", created, model: modelObj.id,
@@ -854,24 +943,46 @@ async function handleChat(req, res, body, deps) {
     };
 
     let citationsSent = false;
-    for await (const ev of upstream.chat(chatOpts)) {
-      armIdle();
-      const hadCitations = citations.length > 0;
-      collect(ev);
-      const fr = ev.data?.flowResult || {};
-      if (fr.reasoningContent) {
-        res.write(`data: ${JSON.stringify(baseChunk({ reasoning_content: fr.reasoningContent }))}\n\n`);
+    const splitter = new ThinkingSplitter();
+    // 把 <thinking> 写进正文的情况拆出来：思考走 reasoning_content，正文才参与工具解析
+    const applySplit = (se) => {
+      if (se.type === "reasoning") {
+        reasoning += se.text;
+        res.write(`data: ${JSON.stringify(baseChunk({ reasoning_content: se.text }))}\n\n`);
+        return;
       }
-      if (fr.outContent && extractor) {
-        emitTextEvents(extractor.feed(fr.outContent));
-      } else if (fr.outContent) {
-        res.write(`data: ${JSON.stringify(baseChunk({ content: fr.outContent }))}\n\n`);
+      content += se.text;
+      if (extractor) emitTextEvents(extractor.feed(se.text));
+      else res.write(`data: ${JSON.stringify(baseChunk({ content: se.text }))}\n\n`);
+    };
+    const feedOut = (txt) => { for (const se of splitter.feed(txt)) applySplit(se); };
+
+    let attemptDialogue = dialogue;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const contentAtStart = content.length;
+      const callsAtStart = toolCallCount;
+      for await (const ev of upstream.chat({ ...chatOpts, dialogue: attemptDialogue })) {
+        armIdle();
+        const hadCitations = citations.length > 0;
+        collect(ev, { textInto: false });
+        const fr = ev.data?.flowResult || {};
+        if (fr.reasoningContent) {
+          reasoning += fr.reasoningContent;
+          res.write(`data: ${JSON.stringify(baseChunk({ reasoning_content: fr.reasoningContent }))}\n\n`);
+        }
+        if (fr.outContent) feedOut(fr.outContent);
+        if (!hadCitations && citations.length && !citationsSent) {
+          citationsSent = true;
+          res.write(`data: ${JSON.stringify(baseChunk({}, { x_citations: citations }))}\n\n`);
+        }
+        if (fr.finishReason === "stop") break;
       }
-      if (!hadCitations && citations.length && !citationsSent) {
-        citationsSent = true;
-        res.write(`data: ${JSON.stringify(baseChunk({}, { x_citations: citations }))}\n\n`);
-      }
-      if (fr.finishReason === "stop") break;
+      for (const se of splitter.flush()) applySplit(se); // 冲出本轮残留（未闭合思考按 reasoning 处理）
+      splitter.reset(); // 下一轮是独立请求，不能沿用未闭合的 <thinking> 状态
+      const produced = content.length > contentAtStart || toolCallCount > callsAtStart;
+      if (produced || !tools.length || attempt === 1) break;
+      attemptDialogue = dialogue + NUDGE_TEXT;
+      log("[chat] 空回复（只有思考），自动续写一次");
     }
     if (extractor) emitTextEvents(extractor.flush()); // 流结束：冲出残余文本/未闭合的 tool_call
     // 结束块（携带会话元数据）
@@ -916,12 +1027,12 @@ async function handleChat(req, res, body, deps) {
 
   finalize();
 
-  function collect(ev) {
+  function collect(ev, { textInto = true } = {}) {
     const d = ev.data || {};
     if (d.sessionId) sidOut = d.sessionId;
     const fr = d.flowResult || {};
-    if (fr.outContent) content += fr.outContent;
-    if (fr.reasoningContent) reasoning += fr.reasoningContent;
+    if (textInto && fr.outContent) content += fr.outContent;
+    if (textInto && fr.reasoningContent) reasoning += fr.reasoningContent;
     if (fr.finishReason) lastFinish = fr.finishReason;
     if (fr.modelType) modelUsed = fr.modelType;
     if (d.responseStatement) statement = d.responseStatement;

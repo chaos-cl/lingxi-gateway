@@ -196,5 +196,25 @@ console.log("\n=== 14. 正文里的中文引号不能被破坏 ===");
   ok(c[0] && argsOf(c[0]).payload === "他说“你好”然后走了", "值内弯引号原样保留", JSON.stringify(c[0] ? argsOf(c[0]).payload : null));
 }
 
+console.log("\n=== 16. 少一个右括号（线上 1696 字符样本）→ 结构补全 ===");
+{
+  // 原文结构：{name, arguments:{tool_name, args:{action, domain, params:{session_id, expression}}}} 少最后 1 个 }
+  const expr = "(function(){var P=window.__PELICAN;if(!P)return 'no-P';return JSON.stringify({a:1});})()";
+  const raw = '<tool_call>\n{"name": "CallDeferredTool", "arguments": {"tool_name": "ControlHub", "args": {"action": "evaluate", "domain": "browser", "params": {"session_id": "embedded-browser-panel-view-4", "expression": "' + expr + '"}}}\n</tool_call>';
+  const ev = run(raw);
+  const c = callsOf(ev);
+  ok(c.length === 1 && c[0].function.name === "CallDeferredTool", "补右括号后成功解析", `got ${c.length}`);
+  const a = c[0] ? argsOf(c[0]) : {};
+  ok(a.args?.params?.expression === expr, "expression 完整无损（含引号与括号）");
+  ok(a.args?.params?.session_id === "embedded-browser-panel-view-4", "嵌套字段正确");
+}
+
+console.log("\n=== 17. 字符串未闭合（真截断）不得补全 ===");
+{
+  const raw = '<tool_call>\n{"name": "Write", "arguments": {"payload": "+++ /a.html\\n<div class=\\"x';
+  const c = callsOf(run(raw));
+  ok(c.length === 1 && c[0].function.arguments === "{}", "只补发空参数调用，不伪造半截内容", c[0]?.function.arguments);
+}
+
 console.log(`\n===== ${pass} 通过 / ${fail} 失败 =====`);
 process.exit(fail ? 1 : 0);
