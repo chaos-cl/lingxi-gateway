@@ -123,7 +123,7 @@ export function aggregate({ days = 14 } = {}) {
     mm.elapsedMs += r.elapsedMs || 0;
     mm.lastTs = Math.max(mm.lastTs, r.ts);
 
-    totals.calls++; ok ? totals.ok++ : totals.errors++;
+    totals.calls++; if (cancelled) totals.cancelled++; else if (ok) totals.ok++; else totals.errors++;
     totals.promptChars += r.promptChars || 0;
     totals.contentChars += r.contentChars || 0;
     totals.reasoningChars += r.reasoningChars || 0;
