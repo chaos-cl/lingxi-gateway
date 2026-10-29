@@ -74,10 +74,10 @@ export function aggregate({ days = 14 } = {}) {
   const rows = readUsage({ sinceMs: since });
 
   const byDay = {};
-  for (const d of dayList) byDay[d] = { date: d, calls: 0, ok: 0, errors: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, models: {} };
+  for (const d of dayList) byDay[d] = { date: d, calls: 0, ok: 0, errors: 0, cancelled: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, models: {} };
   const byModel = {};
   const modelNames = {};
-  const totals = { calls: 0, ok: 0, errors: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, firstTs: null, lastTs: null, todayCalls: 0, todayTokens: 0 };
+  const totals = { calls: 0, ok: 0, errors: 0, cancelled: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, firstTs: null, lastTs: null, todayCalls: 0, todayTokens: 0 };
   const today = dayKey(Date.now());
 
   for (const r of rows) {
@@ -85,15 +85,16 @@ export function aggregate({ days = 14 } = {}) {
     const bucket = byDay[d];
     if (!bucket) continue;
     const ok = r.ok !== false;
+    const cancelled = r.cancelled === true; // 客户端主动取消（关页面/点停止）
     const outChars = (r.contentChars || 0) + (r.reasoningChars || 0);
-    const outTok = estTokens(outChars);
+    const outTok = r.completionTokens ?? estTokens(outChars);
     // 旧记录没有 promptTokens/cacheTokens 字段 → 回退为按字符估算 / 0
     const pTok = r.promptTokens ?? estTokens(r.promptChars || 0);
     const cTok = r.cacheTokens || 0;
     // 只有上报过缓存字段的调用才计入命中率分母（旧记录/未启用估算时不污染统计）
     const cMeasured = r.cacheTokens == null ? 0 : pTok;
 
-    bucket.calls++; ok ? bucket.ok++ : bucket.errors++;
+    bucket.calls++; if (cancelled) bucket.cancelled++; else if (ok) bucket.ok++; else bucket.errors++;
     if (r.think) bucket.think++;
     if (r.search) bucket.search++;
     bucket.promptChars += r.promptChars || 0;
@@ -105,11 +106,11 @@ export function aggregate({ days = 14 } = {}) {
     bucket.cachePromptTokens += cMeasured;
     bucket.elapsedMs += r.elapsedMs || 0;
     const m = (bucket.models[r.model] ||= { calls: 0, errors: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0 });
-    m.calls++; if (!ok) m.errors++; m.outputTokens += outTok; m.elapsedMs += r.elapsedMs || 0;
+    m.calls++; if (!ok && !cancelled) m.errors++; m.outputTokens += outTok; m.elapsedMs += r.elapsedMs || 0;
     m.promptTokens += pTok; m.cacheTokens += cTok; m.cachePromptTokens += cMeasured;
 
-    const mm = (byModel[r.model] ||= { model: r.model, name: r.modelName || r.model, calls: 0, ok: 0, errors: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, lastTs: 0 });
-    mm.calls++; ok ? mm.ok++ : mm.errors++;
+    const mm = (byModel[r.model] ||= { model: r.model, name: r.modelName || r.model, calls: 0, ok: 0, errors: 0, cancelled: 0, think: 0, search: 0, promptChars: 0, contentChars: 0, reasoningChars: 0, outputTokens: 0, promptTokens: 0, cacheTokens: 0, cachePromptTokens: 0, elapsedMs: 0, lastTs: 0 });
+    mm.calls++; if (cancelled) mm.cancelled = (mm.cancelled || 0) + 1; else if (ok) mm.ok++; else mm.errors++;
     if (r.think) mm.think++;
     if (r.search) mm.search++;
     mm.promptChars += r.promptChars || 0;

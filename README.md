@@ -372,6 +372,14 @@ node tests/tool-calls.test.mjs
 
 ---
 
+### 可观测性与统计口径
+
+- `data/usage.jsonl` 每次调用一行：耗时、正文/思考字数、工具调用数、估算 token、缓存命中估算
+- 客户端主动断开（关页面/点停止）记为 `cancelled: true`，**不计入失败**
+- 日志行带 `finish=<上游结束原因>`，便于区分"模型正常收尾"与"被截断"
+- token 估算按 CJK 感知加权（中文 ≈1.5 字/token，ASCII/代码 ≈3.5 字/token），比一律 `字符×0.6` 更贴近实际（代码类内容此前会偏高近一倍）
+- 回归测试：`node tests/tool-calls.test.mjs`（解析，63 项）、`node tests/gateway-e2e.test.mjs`（打桩端到端，36 项）
+
 ## 🛠 开发与构建
 
 ```bash

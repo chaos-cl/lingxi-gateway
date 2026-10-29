@@ -87,11 +87,14 @@ export class Upstream {
 
   /* ---------- 对话主流程（异步生成器，逐 SSE 事件 yield） ---------- */
   async *chat({ model, think, dialogue, sessionId = "", webSearch = false, signal }) {
-    const release = await this._acquire();
-    let released = false;
+    // 快速路径：模型状态已一致时不必抢锁。否则同一模型的并发请求会互相排队到"首包"，
+    // 一个 5 分钟的长思考流会把其他请求一起堵住（线上 p10 速度只有 3 字符/s 就是这个原因）。
+    const needSwitch = this._modelState !== `${model}|${think ? 1 : 0}`;
+    const release = needSwitch ? await this._acquire() : null;
+    let released = !needSwitch;
     const rel = () => { if (!released) { released = true; release(); } };
     try {
-      await this._ensureModelLocked(model, think, signal);
+      if (needSwitch) await this._ensureModelLocked(model, think, signal);
 
       const send = async () => {
         const { basic, userId } = await this.tokens.get();

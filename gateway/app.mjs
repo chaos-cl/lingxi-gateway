@@ -84,7 +84,7 @@ export function createGateway(opts = {}) {
 
   const config = {
     ...envCfg,
-    ...(opts.port ? { port: Number(opts.port) } : {}),
+    ...(opts.port != null ? { port: Number(opts.port) } : {}), // 0 = 让系统分配空闲端口
   };
 
   // Token 落盘复用：铸造要求 cookie 新鲜、token 却有 ~25 天有效期，存盘后重启无需重新登录
@@ -759,7 +759,20 @@ function lastUserText(messages) {
   throw new UpstreamError("messages 中没有 user 消息", { status: 400 });
 }
 
-const estTokens = (chars) => Math.ceil(chars * 0.6); // 粗略估算，仅用于 usage 展示
+const estTokens = (chars) => Math.ceil(chars * 0.6); // 粗略估算（仅给"字符数"用，如缓存前缀）
+/** CJK 感知估算：中文约 1.5 字/token，ASCII/代码约 3.5 字/token（统一 0.6 对代码类内容偏差近一倍） */
+function estTokensText(s) {
+  const str = String(s || "");
+  if (!str) return 0;
+  let cjk = 0, other = 0;
+  for (const ch of str) {
+    const c = ch.codePointAt(0);
+    if (c >= 0x2e80 && c <= 0x9fff || c >= 0xf900 && c <= 0xfaff || c >= 0xff00 && c <= 0xffef) cjk++;
+    else if (c > 0x7f) other++;
+    else other++;
+  }
+  return Math.ceil(cjk / 1.5 + other / 3.5);
+}
 
 /* ---------------- 缓存命中估算 ----------------
  * 139 上游（ai.yun.139.com）的 SSE 事件里**没有任何 token/usage 字段**（实测：只有
@@ -923,8 +936,8 @@ async function handleChat(req, res, body, deps) {
   const promptChars = dialogue.length;
   // usage 块（所有返回路径共用）：带缓存字段，供客户端统计命中率
   const usageBlock = () => {
-    const promptTokens = estTokens(promptChars);
-    const completionTokens = estTokens(content.length + reasoning.length);
+    const promptTokens = estTokensText(dialogue);
+    const completionTokens = estTokensText(content) + estTokensText(reasoning);
     return {
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
@@ -941,7 +954,7 @@ async function handleChat(req, res, body, deps) {
   let lastFinish = "";
   // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
   const finalize = () => {
-    log(`[chat] ${modelObj.name}${think ? "+think" : ""}${webSearch ? "+search" : ""}${toolCallCount ? "+tools(" + toolCallCount + ")" : ""} | ${sessionId ? "续会话" : "新会话"} ${sidOut || ""} | ${content.length}字${cacheTokens ? " 缓存≈" + cacheTokens + "tok" : ""} ${Date.now() - t0}ms`);
+    log(`[chat] ${modelObj.name}${think ? "+think" : ""}${webSearch ? "+search" : ""}${toolCallCount ? "+tools(" + toolCallCount + ")" : ""} | ${sessionId ? "续会话" : "新会话"} ${sidOut || ""} | ${content.length}字 finish=${lastFinish || "-"}${cacheTokens ? " 缓存≈" + cacheTokens + "tok" : ""} ${Date.now() - t0}ms`);
     // 原始抓包（排查上游截断/畸形输出用）：LINGXI_CAPTURE_DIR=/path 打开
     if (process.env.LINGXI_CAPTURE_DIR) {
       try {
@@ -956,7 +969,7 @@ async function handleChat(req, res, body, deps) {
     recordUsage({
       model: modelObj.id, modelName: modelObj.name, think: !!think, search: !!webSearch,
       ok: true, promptChars, contentChars: content.length, reasoningChars: reasoning.length,
-      promptTokens: estTokens(promptChars), completionTokens: estTokens(content.length + reasoning.length),
+      promptTokens: estTokensText(dialogue), completionTokens: estTokensText(content) + estTokensText(reasoning),
       cacheTokens,
       elapsedMs: Date.now() - t0, toolCalls: toolCallCount,
     });
@@ -1105,6 +1118,8 @@ async function handleChat(req, res, body, deps) {
     if (res.writableEnded) return;
     const status = e.status || 502;
     const message = abortReason || e.message;
+    // 客户端主动取消（关页面/点停止）不是故障：单独标记，别把统计里的"失败"搞脏
+    const cancelled = !abortReason && /abort/i.test(String(e?.name || "") + String(e?.message || ""));
     if (stream && res.headersSent) {
       res.write(`data: ${JSON.stringify({ error: { message, type: "upstream_error", code: status } })}\n\n`);
       res.write("data: [DONE]\n\n");
@@ -1114,13 +1129,13 @@ async function handleChat(req, res, body, deps) {
     }
     recordUsage({
       model: modelObj.id, modelName: modelObj.name, think: !!think, search: !!webSearch,
-      ok: false, error: String(message).slice(0, 200),
+      ok: false, ...(cancelled ? { cancelled: true } : {}), error: String(message).slice(0, 200),
       promptChars: dialogue?.length || 0, contentChars: content.length, reasoningChars: reasoning.length,
-      promptTokens: estTokens(dialogue?.length || 0), completionTokens: estTokens(content.length + reasoning.length),
+      promptTokens: estTokensText(dialogue || ""), completionTokens: estTokensText(content) + estTokensText(reasoning),
       cacheTokens,
       elapsedMs: Date.now() - t0, toolCalls: 0,
     });
-    log(`[chat] 失败: ${message}`);
+    log(cancelled ? `[chat] 客户端取消（已生成 ${content.length} 字）` : `[chat] 失败: ${message}`);
     return;
   }
 
@@ -1240,7 +1255,7 @@ async function handleChat(req, res, body, deps) {
     saveConfig,
     /** 启动监听（127.0.0.1）；返回实际端口 */
     start(port) {
-      const p = Number(port || config.port || 8317);
+      const p = Number(port != null ? port : (config.port != null ? config.port : 8317)); // 0 = 系统分配
       return new Promise((resolve, reject) => {
         server.once("error", reject);
         server.listen(p, "127.0.0.1", () => {
