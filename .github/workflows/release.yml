@@ -41,6 +41,7 @@ jobs:
             dist/*.dmg
             dist/*.dmg.blockmap
           if-no-files-found: error
+          retention-days: 3   # 免费额度仅 0.5GB；发布到 Release 后 artifacts 无保留价值
 
   windows:
     name: Windows (x64)
@@ -70,6 +71,7 @@ jobs:
             dist/*.exe
             dist/*.zip
           if-no-files-found: error
+          retention-days: 3   # 免费额度仅 0.5GB；发布到 Release 后 artifacts 无保留价值
 
   release:
     name: Publish Release
@@ -95,3 +97,34 @@ jobs:
             artifacts/macos-packages/*.dmg
             artifacts/windows-packages/*.exe
             artifacts/windows-packages/*.zip
+
+      - name: Delete artifacts after publish（Actions 存储免费额度仅 0.5GB，发布完成即清）
+        if: always()
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            macos-packages
+            windows-packages
+
+  cleanup-artifacts:
+    name: Cleanup old release assets（只保留最新版本）
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove assets of non-latest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          latest_tag="${GITHUB_REF_NAME}"
+          echo "保留最新版本: $latest_tag"
+          for rel in $(gh release list -R "$REPO" --limit 50 --json tagName -q '.[].tagName'); do
+            [ "$rel" = "$latest_tag" ] && continue
+            while IFS= read -r asset; do
+              [ -z "$asset" ] && continue
+              echo "  $rel: 删除 $asset"
+              gh release delete-asset "$rel" "$asset" -R "$REPO" -y || true
+            done < <(gh release view "$rel" -R "$REPO" --json assets -q '.assets[].name')
+          done
