@@ -1,0 +1,2 @@
+
+{"name": "Bash", "arguments": {"command":"powershell -NoProfile -Command \"Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | Where-Object {\\$_.DisplayName} | Select-Object -ExpandProperty DisplayName | Sort-Object\",\"description":"List all installed programs to find VPN/accelerator/streaming software"}}

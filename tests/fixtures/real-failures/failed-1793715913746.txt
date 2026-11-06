@@ -1,0 +1,3 @@
+
+<tool_call>
+{"name": "ExecCommand", "arguments": {"cmd":"$g='E:\bf\OLDSSD500\炎龙骑士团外传风之纹章'; Get-ChildItem -Force $g | Select-Object Mode,Length,Name | Format-Table -AutoSize; Write-Output '--- exe/com/bat ---'; Get-ChildItem -Recurse -Depth 1 -Force $g -Include *.exe,*.com,*.bat | Select-Object -First 30 FullName | Format-Table -AutoSize", "yield_time_ms": 12000}}

@@ -29,3 +29,6 @@ Thumbs.db
 /tmp/
 .openbitfun/
 /.openbitfun/search/flashgrep-index/
+
+# 测试临时数据目录
+tests/.tmp-selftest/
