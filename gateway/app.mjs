@@ -107,6 +107,9 @@ export function createGateway(opts = {}) {
    */
   const MCLOUD_BASE = "https://personal-kd-njs.yun.139.com";
   const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+  // 单次请求随对话送达的图片上限：agent 客户端（如 zcode）会把历史里的所有截图每轮重发，
+  // 上游对超量 fileList 直接报「参数错误」——只保留最近的若干张（最早的截图对当前轮次价值最低）
+  const IMAGE_MAX_PER_REQUEST = 6;
   const mcloudHeaders = (basic) => ({
     // 头集合与 webui 实抓对齐；x-yun-client-info 为必需头（缺失会被 hcy 判 04000003「请求头不合法」）
     Accept: "application/json, text/plain, */*",
@@ -176,8 +179,9 @@ export function createGateway(opts = {}) {
       throw new UpstreamError(`图片上传失败（create）：${create ? JSON.stringify(create).slice(0, 150) : "HTTP " + createRes.status}`, { status: 502 });
     }
     const meta = create.data;
-    if (!(meta.exist && meta.fileId)) {
-      // 秒传未命中：单分片直传（presigned URL 自带签名，无需鉴权头）→ complete
+    if (!((meta.exist || meta.rapidUpload) && meta.fileId)) {
+      // 秒传未命中（rapidUpload=false）：单分片直传（presigned URL 自带签名，无需鉴权头）→ complete。
+      // 秒传两种形态都直接用 fileId：exist=true（同名同 hash 重复创建）、rapidUpload=true（同 hash 异名，平台已挂新条目）
       const part = (meta.partInfos || [])[0];
       if (!meta.uploadId || !part?.uploadUrl) throw new UpstreamError("图片上传失败（create 未返回 uploadId/uploadUrl）", { status: 502 });
       const put = await fetch(part.uploadUrl, { method: "PUT", body: buffer, headers: { "Content-Type": "application/oct-stream" } });
@@ -1568,12 +1572,20 @@ async function handleChat(req, res, body, deps) {
 
   // 视觉：提取 OpenAI image_url → 上传云盘（sha256 去重/秒传）→ attachment。
   // 上传失败降级为纯文本对话（图片部分丢弃但流程不中断），并把原因写进会话日志
-  let imageMetas = [], imageError = "";
+  let imageMetas = [], imageError = "", imageDropped = 0;
   const rawImageUrls = extractImageUrls(messages, !!sessionId);
-  if (rawImageUrls.length) {
+  {
+    // 同一张图在历史里出现多次（zcode 每轮重发全量历史）→ 按 URL 去重；超出上限只保留最近 N 张
+    const seen = new Set();
+    const uniq = [];
+    for (const url of rawImageUrls) {
+      if (!seen.has(url)) { seen.add(url); uniq.push(url); }
+    }
+    const capped = uniq.slice(-IMAGE_MAX_PER_REQUEST);
+    imageDropped = uniq.length - capped.length;
     try {
       let idx = 0;
-      for (const url of rawImageUrls) {
+      for (const url of capped) {
         idx++;
         const { buffer, mime, ext } = await decodeImageUrl(url);
         if (buffer.length > IMAGE_MAX_BYTES) throw new UpstreamError(`图片超过 ${Math.round(IMAGE_MAX_BYTES / 1048576)}MB 上限（${buffer.length} 字节）`, { status: 400 });
@@ -1581,7 +1593,7 @@ async function handleChat(req, res, body, deps) {
         const name = `gateway-${Date.now()}-${idx}.${ext}`;
         imageMetas.push(await uploadImage({ buffer, mime, name }));
       }
-      log(`[chat] 图片上传 ${imageMetas.length} 张：${imageMetas.map((i) => `${i.name}(${Math.round(i.size / 1024)}KB)`).join(", ")}`);
+      log(`[chat] 图片上传 ${imageMetas.length} 张${imageDropped ? `（历史共 ${uniq.length} 张，超出上限丢弃最早 ${imageDropped} 张）` : ""}：${imageMetas.map((i) => `${i.name}(${Math.round(i.size / 1024)}KB)`).join(", ")}`);
     } catch (e) {
       imageError = String(e.message || e).slice(0, 200);
       log(`[chat] 图片上传失败，按纯文本继续：${imageError}`);
@@ -1653,6 +1665,7 @@ async function handleChat(req, res, body, deps) {
   const sessToolCalls = []; // 最终下发给客户端的 tool_calls（流式在 emit 时收，非流式在提取后收）
   if (sess) {
     sess.images = imageMetas.map((i) => ({ name: i.name, fileId: i.fileId, size: i.size }));
+    if (imageDropped) sess.imagesDropped = imageDropped;
     if (imageError) sess.imageError = imageError;
   }
 
