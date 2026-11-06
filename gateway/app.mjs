@@ -973,6 +973,28 @@ class ToolCallExtractor {
     }
     return events;
   }
+  /**
+   * 流结束时是否还挂着未闭合的工具调用块（上游在块中间提前自停，线上高频故障）。
+   * 返回截断尾部片段（供续写指令引用原文）；null = 无需续写：
+   *   - 普通文本尾巴不是截断；
+   *   - 未闭合块若其实已可解析（完整 JSON 只差闭合标签，区域扫描能救回）→ flush 直接出结果，不浪费续写轮。
+   * 覆盖两种挂起状态：inCall（<tool_call> 块未闭合）、裸 JSON 等待态（命中特征但 JSON 未配对）。
+   */
+  truncatedTail(max = 80) {
+    const pend = String(this.pend || "");
+    const s = pend.trim();
+    if (s.length < 8) return null;
+    if (this.inCall) {
+      return parseToolCallBlock(pend, 0).length ? null : s.slice(-max);
+    }
+    if (this.allowed && BARE_JSON_RE.test(pend)) {
+      const closed = autoCloseJson(repairSmartQuotes(pend));
+      const fixed = closed ? parseToolCallBlock(closed, 0) : parseToolCallBlock(repairSmartQuotes(pend), 0);
+      return fixed.length ? null : s.slice(-max);
+    }
+    return null;
+  }
+
   _drain(final = false) {
     const events = [];
     while (true) {
@@ -1209,6 +1231,19 @@ function continuationDirective(content) {
   return (
     `\n\n（系统提示：你上一条回复被上游意外截断，你最后输出的是「${tail}」。` +
     `请从中断处直接继续输出剩余内容：不要重复任何已输出的文字，不要重新开始或另起话题，不要输出任何解释说明。）`
+  );
+}
+
+/**
+ * 工具调用截断的续写指令：带上未闭合块的尾部原文，要求补全该调用。
+ * 模型「从断点续写」或「完整重写」都能被解析层消化（区域扫描对块内嵌套标签/多 JSON 均兼容）。
+ */
+function toolContinuationDirective(tail) {
+  return (
+    `\n\n（系统提示：你上一条回复里的工具调用在「${tail}」处被意外截断，JSON 参数不完整、调用块未闭合。` +
+    `请立即补全：从中断处继续输出剩余内容，直到该调用块以 </tool_call> 正常闭合；` +
+    `不要重复截断前已输出的内容，不要输出任何解释或另起话题。` +
+    `若无法准确续写，则完整重写整个 <tool_call>{"name": ..., "arguments": {...}}</tool_call> 块（内容与原调用意图一致）。）`
   );
 }
 
@@ -1456,7 +1491,23 @@ async function handleChat(req, res, body, deps) {
         toolCallsOut = [];
         if (tools.length) {
           const extractor = new ToolCallExtractor(allowedTools, canAlias);
-          const events = [...extractor.feed(content), ...extractor.flush()];
+          let events = [...extractor.feed(content)];
+          // 上游在 <tool_call> 块中间提前自停（finishReason=stop 但 JSON 未闭合）：
+          // 定向追加一轮"补全该调用"的续写，输出喂进同一个提取器再收尾，把完整参数救回来
+          const truncTail = extractor.truncatedTail();
+          if (truncTail && attempt < 2) {
+            log(`[chat] 工具调用被截断（块尾「${truncTail.slice(-40)}」），自动续写补全`);
+            let extra = "";
+            for await (const ev of upstream.chat({ ...chatOpts, dialogue: dialogue + toolContinuationDirective(truncTail) })) {
+              collect(ev, { textInto: false }); // 续写是隐藏修复轮：不并入正文/思考，只取输出
+              armIdle();
+              const fr = ev.data?.flowResult || {};
+              if (fr.outContent) extra += fr.outContent;
+              if (fr.finishReason === "stop") break;
+            }
+            events.push(...extractor.feed(extra));
+          }
+          events.push(...extractor.flush());
           content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
           toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
           toolCallCount = toolCallsOut.length;
@@ -1572,6 +1623,14 @@ async function handleChat(req, res, body, deps) {
       }
       for (const se of splitter.flush()) applySplit(se); // 冲出本轮残留（未闭合思考按 reasoning 处理）
       splitter.reset(); // 下一轮是独立请求，不能沿用未闭合的 <thinking> 状态
+      // 工具调用块被上游截断（未闭合自停）：定向续写补全，输出仍喂进同一个提取器
+      //（块闭合后正常吐出 tool_call）；最多 2 轮，仍截断则走 flush 的空参数补发兜底
+      const truncTail = extractor ? extractor.truncatedTail() : null;
+      if (truncTail && attempt < 2) {
+        log(`[chat] 工具调用被截断（块尾「${truncTail.slice(-40)}」），自动续写补全`);
+        attemptDialogue = dialogue + toolContinuationDirective(truncTail);
+        continue;
+      }
       const produced = content.length > contentAtStart || toolCallCount > callsAtStart;
       // 句中截断：在同一个 SSE 流里向上游追加一轮"从中断处继续"，客户端看到连续回复
       if (produced && attempt < 2 && toolCallCount === callsAtStart && looksTruncatedStop(content, reasoning)) {

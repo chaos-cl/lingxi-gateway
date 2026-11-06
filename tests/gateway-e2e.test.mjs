@@ -154,6 +154,35 @@ for (const stream of [false, true]) {
     ok(!o.text.startsWith("\\n"), "字面 \\n 残影已剥除", JSON.stringify(o.text.slice(0, 12)));
     ok(o.finish === "stop", "finish 正常收尾", o.finish);
   }
+  console.log(`\n=== G. 工具调用被截断 → 定向续写补全（${tag}） ===`);
+  setScript([
+    '<tool_call>\n{"name": "Write", "arguments": {"file_path": "/tmp/plan.md", "payload": "计划：第一',
+    '步搭建骨架，第二步填充数据。"}}\n</tool_call>',
+  ]);
+  {
+    const o = await ask(stream);
+    ok(o.calls.length === 1, "续写后解析出 1 个完整调用", `got ${o.calls.length}`);
+    let a = null; try { a = JSON.parse(o.calls[0]?.function.arguments || "null"); } catch { /* 保持 null */ }
+    ok(a?.file_path === "/tmp/plan.md", "file_path 完整", JSON.stringify(a?.file_path));
+    ok(a?.payload === "计划：第一步搭建骨架，第二步填充数据。", "参数在截断处完整续上", JSON.stringify(a?.payload || "").slice(0, 60));
+    ok(o.finish === "tool_calls", "finish_reason=tool_calls", o.finish);
+    ok(seenDialogues[1]?.includes("被意外截断"), "续写请求携带截断指令", (seenDialogues[1] || "").slice(-80));
+    ok(seenDialogues[1]?.includes("payload\": \"计划：第一"), "指令携带截断块尾部原文", (seenDialogues[1] || "").slice(-100));
+    ok(!o.text.includes("[网关]"), "无失败提示文本", o.text.slice(0, 60));
+  }
+  console.log(`\n=== H. 工具调用截断 + 续写仍截断 → 回退空参数补发（${tag}） ===`);
+  setScript([
+    '<tool_call>\n{"name": "Write", "arguments": {"file_path": "/a.md", "payload": "AAA',
+    'BBB',
+  ]);
+  {
+    const o = await ask(stream);
+    ok(o.text.includes("[网关]"), "有截断原因提示", o.text.slice(0, 60));
+    let leaked = false;
+    for (const c of o.calls) { try { const a = JSON.parse(c.function.arguments); if (typeof a?.payload === "string" && /AAA|BBB/.test(a.payload)) leaked = true; } catch { /* 非法参数不算泄漏 */ } }
+    ok(!leaked, "绝不携带半截 payload", "");
+    ok(o.calls.length >= 1 && o.calls[0].function.name === "Write", "补发空参数调用保住循环", o.calls.map((c) => c.function.name).join(","));
+  }
 }
 
 await gw.stop();
