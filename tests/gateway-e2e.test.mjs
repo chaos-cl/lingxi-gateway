@@ -34,8 +34,9 @@ globalThis.fetch = async (url, init = {}) => {
   if (u.includes("/chat/v2/add")) {
     const body = JSON.parse(init.body || "{}");
     seenDialogues.push(body.dialogueInput?.dialogue || "");
-    const text = script[Math.min(chatCalls++, script.length - 1)] ?? "";
-    const sse = `data: ${JSON.stringify({ success: true, data: { sessionId: "s", flowResult: { outContent: text } } })}\n\n`
+    const entry = script[Math.min(chatCalls++, script.length - 1)] ?? "";
+    const r = typeof entry === "object" ? entry : { outContent: entry };
+    const sse = `data: ${JSON.stringify({ success: true, data: { sessionId: "s", flowResult: { outContent: r.outContent || "", reasoningContent: r.reasoningContent || "" } } })}\n\n`
       + `data: ${JSON.stringify({ success: true, data: { flowResult: { outContent: "", finishReason: "stop" } } })}\n\n`;
     return new Response(sse, { headers: { "content-type": "text/event-stream" } });
   }
@@ -138,6 +139,20 @@ for (const stream of [false, true]) {
     ok(o.calls.length === 1 && o.calls[0].function.name === "Read", "裸 JSON 识别为调用", `got ${o.calls.length}`);
     ok(o.text.trim() === "先确认下环境。", "前面的正文保留、JSON 不残留", JSON.stringify(o.text));
     ok(o.usage?.total_tokens > 0, "usage 正常上报", JSON.stringify(o.usage?.total_tokens));
+  }
+  console.log(`\n=== F. 句中截断（长思考后短正文自停）→ 自动续写拼接（${tag}） ===`);
+  setScript([
+    { reasoningContent: "x".repeat(300), outContent: "\\n\\n我将为你构建这个完整的 Schwarzschild 黑洞" },
+    { outContent: "光线追踪器，包含以下模块：\n1. 视界渲染\n2. 光子环\n3. 吸积盘。" },
+  ]);
+  {
+    const o = await ask(stream);
+    ok(seenDialogues.length === 2, "检测到截断并自动续写（第二次上游请求）", `实际 ${seenDialogues.length} 次`);
+    ok(seenDialogues[1]?.includes("从中断处直接继续"), "续写请求携带截断续写指令");
+    ok(seenDialogues[1]?.includes("Schwarzschild 黑洞"), "指令携带截断点原文", (seenDialogues[1] || "").slice(-120));
+    ok(o.text.includes("我将为你构建") && o.text.includes("吸积盘"), "两段输出拼接为同一份回复", JSON.stringify(o.text.slice(0, 60)));
+    ok(!o.text.startsWith("\\n"), "字面 \\n 残影已剥除", JSON.stringify(o.text.slice(0, 12)));
+    ok(o.finish === "stop", "finish 正常收尾", o.finish);
   }
 }
 

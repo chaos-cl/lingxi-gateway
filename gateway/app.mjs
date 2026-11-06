@@ -185,9 +185,15 @@ function renderDialogue(messages) {
     const label = m.role === "assistant" ? "助手" : "用户";
     return `${label}：${body}${calls}`;
   });
+  // 按最后一条消息动态给出续写边界：agent 循环里最后一条往往是工具结果而非用户消息，
+  // 固定的"回答最后一条用户消息"会误导模型重答旧问题或复述转录稿
+  const lastIsTool = rest[rest.length - 1]?.role === "tool";
+  const tail = lastIsTool
+    ? "以上是一段多轮对话记录（其中 <tool_call> 是助手发起的工具调用，<tool_response> 是系统在工具执行后插入的结果）。对话记录以 <tool_response> 结束——请以「助手」身份从这里继续：基于该工具结果直接给出下一步，要么发起新的 <tool_call> 继续操作，要么给出最终回答。不要复述历史内容；<tool_response> 由系统插入，助手永远不会自己输出它。\n\n"
+    : "以上是一段多轮对话记录（其中 <tool_call> 是助手发起的工具调用，<tool_response> 是系统在工具执行后插入的结果）。请以「助手」身份，直接回答最后一条用户消息。不要复述历史内容，也不要输出 <tool_response>（那不是助手的输出格式）。\n\n";
   return (
     (sys ? sys + "\n\n" : "") +
-    "以下是一段多轮对话记录（其中 <tool_call> 是助手发起的工具调用，<tool_response> 是工具返回的结果）。请作为「助手」角色，直接回答最后一条用户消息，不要复述历史内容。\n\n" +
+    tail +
     lines.join("\n")
   );
 }
@@ -199,7 +205,8 @@ function renderToolCallText(tc) {
   if (typeof args === "string") {
     try { args = JSON.parse(args); } catch { /* 保留原字符串 */ }
   }
-  const argsStr = typeof args === "string" ? args : JSON.stringify(args ?? {});
+  // 仍是字符串（原始 arguments 本身不是合法 JSON）→ 按字符串值渲染，保证历史示例是合法 JSON
+  const argsStr = typeof args === "string" ? JSON.stringify(args) : JSON.stringify(args ?? {});
   return `<tool_call>\n{"name": ${JSON.stringify(f.name ?? tc.name ?? "")}, "arguments": ${argsStr}}\n</tool_call>`;
 }
 
@@ -220,13 +227,232 @@ function renderToolsPrompt(tools) {
     "工具执行结果将以 <tool_response> 块返回给你，根据结果继续回答或再次调用。\n" +
     "单次工具调用的参数体积请控制在 6000 字符以内：大文件先写骨架，再用 Edit 分段补全（上游单次输出长度有限，过长会被截断）。\n" +
     "注意：JSON 的引号必须是半角 ASCII 双引号 \" ，不要用中文引号“”，冒号逗号也用半角 : , ，否则解析会失败。\n" +
+    "只能调用上面「可用工具」清单里列出的工具。清单之外的工具一律不存在——禁止发明、猜测或使用其他名称（如 bash、terminal、run_command 等未列出的名字），否则调用会被客户端拒绝。\n" +
+    "绝对不要自己输出 <tool_response> 块——那是系统在工具执行后插入的结果标记，不是你的输出格式；你只输出正文与 <tool_call>。\n" +
     "若无需使用工具，直接用文字回答。"
+  );
+}
+
+/* ---- 幻觉工具名治理：语义别名 + 参数适配 ----
+ * 上游模型偶尔无视清单输出训练先验里的工具名（bash / read_file / write_file…），
+ * 原样透传会被客户端以 "Tool 'xxx' is not in the allowed list" 拒绝并中断 agent 循环。
+ * 这里按 token 语义重叠把幻觉名映射到本次清单里最接近的工具，并把参数键适配到目标 schema。
+ */
+
+/** 幻觉名 token → 清单工具名 token 的强同义表（命中按 2 分计） */
+const TOKEN_SYNONYMS = {
+  bash: "exec command cmd shell terminal",
+  shell: "exec command cmd bash",
+  terminal: "exec command cmd shell console",
+  console: "exec command cmd terminal",
+  run: "exec execute command",
+  execute: "exec run command",
+  command: "cmd exec",
+  cmd: "command exec",
+  script: "exec command",
+  cat: "read",
+  view: "read show open",
+  open: "read show view",
+  show: "read view",
+  load: "read",
+  create: "write save",
+  save: "write create",
+  store: "write save",
+  patch: "edit replace modify",
+  modify: "edit replace update",
+  update: "edit replace modify",
+  replace: "edit modify patch",
+  find: "grep glob search",
+  search: "grep glob find",
+  list: "glob ls",
+  ls: "glob list",
+  glob: "find list ls",
+  fetch: "fetch url http",
+  url: "fetch http",
+  http: "fetch url",
+  internet: "web search",
+  websearch: "web search internet",
+  agent: "task subagent spawn",
+  task: "agent subagent",
+  subagent: "agent task spawn",
+  spawn: "agent task",
+  todo: "todo task plan",
+  notebook: "notebookedit notebook",
+};
+
+/** 工具名分词：camelCase / snake / kebab 统一拆开（ExecCommand → [exec, command]） */
+const nameTokens = (s) =>
+  String(s)
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+
+/**
+ * 幻觉工具名 → 本次清单里语义最接近的工具。评分：token 精确命中 2 分，同义表命中 2 分；
+ * 唯一最高分且 ≥2 才采纳（并列视为歧义，不映射）。
+ */
+function aliasTarget(name, allowedTools) {
+  const A = nameTokens(name);
+  if (!A.length) return null;
+  const scored = allowedTools.map((allowed) => {
+    const B = new Set(nameTokens(allowed));
+    let score = 0;
+    for (const t of A) {
+      if (B.has(t)) { score += 2; continue; }
+      const syn = String(TOKEN_SYNONYMS[t] || "").split(" ").filter(Boolean);
+      if (syn.some((s) => B.has(s))) score += 2;
+    }
+    return { allowed, score };
+  });
+  const max = Math.max(0, ...scored.map((s) => s.score));
+  if (max < 2) return null;
+  const winners = scored.filter((s) => s.score === max);
+  if (winners.length !== 1) return null; // 歧义不猜
+  return winners[0];
+}
+
+/** 参数键的等义词族：幻觉参数键 → 目标 schema 里同族的键 */
+const ARG_KEY_FAMILIES = [
+  ["command", "cmd", "commandline", "commandline", "shellcommand", "shell_command", "terminalcommand", "terminal_command", "bashcommand", "bash_command", "script", "instruction", "cli"],
+  ["path", "filepath", "file_path", "file", "filename", "location", "uri", "target", "dir", "directory"],
+  ["content", "text", "data", "body", "source", "value", "input", "code", "payload", "newstring", "new_string", "replacement"],
+  ["oldstring", "old_string", "oldtext", "old_text", "pattern", "query", "regex"],
+  ["url", "link", "href", "address"],
+  ["outputmode", "output_mode", "mode", "format"],
+  ["limit", "count", "max", "topk", "top_k"],
+  ["description", "desc", "message", "reason", "summary"],
+  ["offset", "start", "begin", "from"],
+  ["name", "toolname", "tool_name", "id", "key", "domain"],
+];
+
+const canonKey = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/**
+ * 幻觉调用的参数 → 目标工具 schema 的键名适配（bash{command} → ExecCommand{cmd}）。
+ * 只重命名键、不动值；无法归族的键保留原名（客户端一般容忍多余键）；
+ * 目标 required 键缺失且恰好剩一个未匹配键时，把它映射为该 required 键。
+ * 参数不是可解析对象时原样返回（changed=false），不强改。
+ */
+function adaptCallArgsToSchema(argsValue, fnDef) {
+  const props = fnDef?.parameters?.properties;
+  const required = Array.isArray(fnDef?.parameters?.required) ? fnDef.parameters.required : [];
+  const result = { changed: false, arguments: null };
+  if (!props || !Object.keys(props).length) return result;
+  let args = argsValue;
+  if (typeof args === "string") {
+    try { args = JSON.parse(args); }
+    catch { try { args = JSON.parse(repairJsonLoose(args)); } catch { return result; } }
+  }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return result;
+  const canonProps = new Map(Object.keys(props).map((k) => [canonKey(k), k]));
+  const out = {};
+  const leftovers = [];
+  for (const [k, v] of Object.entries(args)) {
+    if (k in props) { out[k] = v; continue; }
+    const direct = canonProps.get(canonKey(k));
+    if (direct) { out[direct] = v; result.changed = true; continue; }
+    const fam = ARG_KEY_FAMILIES.find((f) => f.some((x) => canonKey(x) === canonKey(k)));
+    const hit = fam && Object.keys(props).find((p) => fam.some((x) => canonKey(x) === canonKey(p)));
+    if (hit) { out[hit] = v; result.changed = true; continue; }
+    leftovers.push([k, v]);
+  }
+  for (const req of required) {
+    if (req in out) continue;
+    if (leftovers.length === 1) { const [k, v] = leftovers.shift(); out[req] = v; result.changed = true; }
+  }
+  for (const [k, v] of leftovers) out[k] = v;
+  const sameKeys = !result.changed
+    && Object.keys(out).length === Object.keys(args).length
+    && Object.keys(out).every((k) => k in args);
+  if (!sameKeys) result.arguments = JSON.stringify(out);
+  return result;
+}
+
+/**
+ * 工具名归一器：把模型输出的畸形/幻觉工具名映射到本次请求的清单。
+ * 层级：原样 → 前缀/命名空间剥离（tools__、functions.、mcp__srv__）→ 大小写 → 语义别名（含参数适配）→ 后缀匹配。
+ * 全部落空则原样放行，让客户端明确报错而不是静默丢调用。
+ */
+function createToolCallNormalizer(tools, { log } = {}) {
+  const allowedTools = tools.map((t) => t?.function?.name).filter((n) => typeof n === "string" && n);
+  const allowedLower = new Map(allowedTools.map((n) => [n.toLowerCase(), n]));
+  const schemaOf = (name) => tools.find((t) => (t?.function?.name || t?.name) === name)?.function ?? null;
+  const normalize = (call) => {
+    const fn = call?.function;
+    if (!fn) return null;
+    let name = String(fn.name || "").trim();
+    if (!name) return null;
+    if (!allowedTools.length || allowedTools.includes(name)) return call;
+    let matched = "";
+    const candidates = [
+      name.replace(/^(?:tools?|functions?)__/i, ""),           // tools__CallDeferredTool → CallDeferredTool
+      name.split(/[.:/]/).pop(),                                // functions.Read → Read
+      name.replace(/^(?:tools?|functions?)[._-]/i, ""),
+      name.replace(/^[\w.-]+?__/, ""),                          // mcp__server__tool → tool
+    ];
+    for (const c of candidates) {
+      if (!c) continue;
+      if (allowedTools.includes(c)) { matched = c; break; }
+      const hit = allowedLower.get(c.toLowerCase());
+      if (hit) { matched = hit; break; }
+    }
+    if (!matched) {
+      const alias = aliasTarget(name, allowedTools);
+      if (alias) matched = alias.allowed;
+    }
+    if (matched) {
+      const adapted = adaptCallArgsToSchema(fn.arguments, schemaOf(matched));
+      log?.(`[tools] 工具名归一: ${name} → ${matched}${adapted.changed ? "（参数键已适配）" : ""}`);
+      fn.name = matched;
+      if (adapted.arguments != null) fn.arguments = adapted.arguments;
+      return call;
+    }
+    const tail = allowedTools.find((t) => t.toLowerCase().endsWith(name.split(/[.:/]/).pop().toLowerCase()));
+    if (tail) { fn.name = tail; return call; }
+    return call; // 未命中就原样放行，让客户端明确报错而不是静默丢调用
+  };
+  return { normalize, allowedTools };
+}
+
+/* ---- tool_choice 强制支持 ----
+ * OpenAI 语义：required / {type:"function",function:{name}} 时模型必须发起工具调用。
+ * 上游无原生支持 → 注入高优先级指令；非流式下若模型仍不调用，可带更强指令重试一次。
+ */
+function parseToolChoice(tool_choice, tools) {
+  const names = tools.map((t) => t?.function?.name).filter((n) => typeof n === "string" && n);
+  if (!names.length) return { forced: "", required: false };
+  if (tool_choice === "required") return { forced: "", required: true };
+  if (tool_choice && typeof tool_choice === "object") {
+    const n = tool_choice?.function?.name || tool_choice?.name;
+    if (typeof n === "string" && n.trim()) {
+      const hit = names.find((x) => x === n || x.toLowerCase() === n.trim().toLowerCase());
+      return { forced: hit || n.trim(), required: true };
+    }
+  }
+  return { forced: "", required: false };
+}
+
+function renderToolChoiceDirective(choice) {
+  if (!choice?.required) return "";
+  if (choice.forced) {
+    return (
+      `\n\n# 强制工具调用（系统级要求，最高优先级）\n` +
+      `本轮回复必须且只能发起对工具「${choice.forced}」的一次调用：立即输出 <tool_call> 块调用它，` +
+      `不要输出任何解释、寒暄或纯文字内容。若缺少信息，也必须调用该工具并用合理值补全参数，无法推断的参数传空字符串。`
+    );
+  }
+  return (
+    `\n\n# 强制工具调用（系统级要求，最高优先级）\n` +
+    `本轮回复必须从「可用工具」清单中选择最合适的一个发起调用（输出 <tool_call> 块），不允许输出纯文字回复。`
   );
 }
 
 /* ---- <tool_call> 文本流提取器：处理跨 chunk 边界，输出 text / tool_call 事件 ---- */
 const TC_OPEN = "<tool_call>";
 const TC_CLOSE = "</tool_call>";
+const TR_OPEN = "<tool_response>"; // 助手永远不该输出；出现了=模型在复述/伪造转录稿，剥离
+const TR_CLOSE = "</tool_response>";
 
 /** 尾部与标签前缀的最大重叠长度（防止标签被 chunk 切断） */
 function tagOverlap(s, tag) {
@@ -236,7 +462,7 @@ function tagOverlap(s, tag) {
 }
 
 /** 孤立闭合标签（qwen 连续多工具调用时多余的 </tool_call> 残骸）连同周边空白一并剥除 */
-const STRAY_CLOSE_RE = /(?:\s*<\/tool_call>)+/g;
+const STRAY_CLOSE_RE = /(?:\s*<\/tool_call>|\s*<\/tool_response>)+/g;
 
 /**
  * 修复 JSON 字符串值内的裸引号/换行（模型输出 shell 命令等含双引号内容时的常见非法 JSON）。
@@ -424,17 +650,60 @@ function autoCloseJson(s) {
   return out;
 }
 
-/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 裸换行 / 尾逗号 / 未转义引号 / 结构补全） */
+/**
+ * 修复 JSON 字符串里的非法转义（线上 Windows 样本：E:\bf\OLDSSD500\炎龙… 的路径反斜杠）。
+ *  - \X（X 不是合法转义字符）→ \\X：如 \炎、\O、\y（不修则 JSON.parse 直接失败）
+ *  - 驱动器路径上下文（含 E:\ / C:\ 的字符串）里 \b\f\r\t\n 也按路径分隔符处理 → \\X：
+ *    否则 \b 被解析成退格符、\n 被解析成换行，路径被静默改写、调用"成功"地打错地方
+ *    （丢换行是可见失败会触发模型重试，路径改写是隐蔽错误，宁可前者）
+ *  - \u 后面不是 4 位十六进制（如 \users）→ \\u
+ */
+function repairInvalidEscapes(s) {
+  let out = "";
+  for (let i = 0; i < s.length; ) {
+    if (s[i] !== '"') { out += s[i++]; continue; }
+    // 找字符串结束（尊重转义），整段交给 repairStrEscapes
+    let j = i + 1;
+    while (j < s.length) {
+      if (s[j] === "\\") { j += 2; continue; }
+      if (s[j] === '"') break;
+      j++;
+    }
+    const seg = s.slice(i, j + 1);
+    const isDrive = /[A-Za-z]:\\/.test(seg);
+    let body = "";
+    for (let k = 1; k < seg.length - 1; k++) {
+      const c = seg[k];
+      if (c !== "\\") { body += c; continue; }
+      const n = seg[k + 1] ?? "";
+      if (n === "") { body += c; continue; }
+      if (!'"\\/:bfnrtu'.includes(n)) { body += "\\\\" + n; k++; continue; }
+      if (isDrive && "bfrtn".includes(n)) { body += "\\\\" + n; k++; continue; }
+      if (n === "u" && !/^[0-9a-fA-F]{4}/.test(seg.slice(k + 2, k + 6))) { body += "\\\\u"; k++; continue; }
+      body += c + n; k++;
+    }
+    out += '"' + body + (j < s.length ? '"' : "");
+    i = j + 1; // 跳过闭合引号（未闭合则跳到末尾）
+  }
+  return out;
+}
+
+/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 非法转义 / 裸换行 / 尾逗号 / 未转义引号 / 结构补全） */
 function parseJsonCalls(raw) {
   const tryParse = (s) => {
     const variants = [];
     const add = (x) => { if (x != null && !variants.includes(x)) variants.push(x); };
+    // 先于原串尝试：\n/\t/\b 是合法转义，原串可能"成功"解析但值被静默污染（E:\temp → E:<TAB>emp）
+    const esc0 = repairInvalidEscapes(s);
+    add(esc0);
     add(s);
     const sq = repairSmartQuotes(s);
     add(sq);
     const fw = repairFullWidth(sq);
     add(fw);
-    const loose = repairJsonLoose(fw);
+    const esc = repairInvalidEscapes(fw);
+    add(esc);
+    const loose = repairJsonLoose(esc);
     add(loose);
     add(repairUnescapedQuotes(loose));
     add(repairUnescapedQuotes(repairJsonLoose(s))); // 不走弯引号修复的兜底
@@ -444,20 +713,67 @@ function parseJsonCalls(raw) {
     }
     return null;
   };
+  /** 解析成功的对象 → 调用列表（拆包装层） */
+  const toCalls = (obj) => {
+    const list = Array.isArray(obj) ? obj : Array.isArray(obj.tool_calls) ? obj.tool_calls : [obj];
+    const out = [];
+    for (const it of list) {
+      const name = it?.name ?? it?.function?.name ?? it?.tool_name;
+      if (!name || typeof name !== "string") continue;
+      let args = it.arguments ?? it.function?.arguments ?? it.parameters ?? it.args ?? {};
+      if (typeof args === "string") { const p = tryParse(args); if (p) args = p; }
+      out.push(unwrapNested({ name: name.trim(), args }));
+    }
+    return out;
+  };
   let obj = tryParse(raw);
-  if (!obj) {
-    const a = raw.indexOf("{"), b = raw.lastIndexOf("}"); // 宽容：剥掉前后杂文字
-    if (a >= 0 && b > a) obj = tryParse(raw.slice(a, b + 1));
+  if (obj) return toCalls(obj);
+  // 整块解析失败：逐个扫描顶层配对 JSON 区域（覆盖"前后杂文字包裹单调用"与
+  // "块内多个并列调用/嵌套第二个 <tool_call>"两类，线上 Windows 样本均出现过）
+  const calls = [];
+  let i = raw.indexOf("{");
+  while (i >= 0) {
+    const end = scanBalancedJson(raw, i);
+    if (end < 0) {
+      // 最后一个未闭合（上游截断）：结构能补全就补全；
+      // 补不出时若前面已找回调用则静默补发空参数骨架，否则返回空走「截断提示 + 补发」路径（给模型留重试指引）
+      const tail = raw.slice(i);
+      const closed = autoCloseJson(repairSmartQuotes(repairInvalidEscapes(tail)));
+      const objs = closed ? tryParse(closed) : null;
+      if (objs) { calls.push(...toCalls(objs)); break; }
+      if (calls.length) {
+        const nm = (tail.match(/"name"\s*:\s*["“”']([^"“”'\s}]+)/) || [])[1];
+        if (nm) calls.push(unwrapNested({ name: nm.trim(), args: {} }));
+      }
+      break;
+    }
+    const regionObj = tryParse(raw.slice(i, end));
+    if (regionObj) calls.push(...toCalls(regionObj));
+    i = raw.indexOf("{", end);
   }
-  if (!obj) return [];
-  const list = Array.isArray(obj) ? obj : Array.isArray(obj.tool_calls) ? obj.tool_calls : [obj];
+  return calls;
+}
+
+/**
+ * 杂交方言（线上 Windows 样本）：模型把 HERMES 的 <function=NAME> 错写成 <parameter=NAME>，
+ * 参数整体塞进 <parameter=arguments>{"cmd":…}</parameter>，结尾 </function> 还在。
+ * 形态：<parameter=ExecCommand></parameter><parameter=arguments>{…}</parameter></function>
+ */
+function parseParameterWrapperCalls(raw) {
+  const pairs = [];
+  const re = /<parameter\s*(?:=\s*([^>\s]+)|name\s*=\s*["']([^"']+)["'])\s*>([\s\S]*?)<\/parameter>/g;
+  let m;
+  while ((m = re.exec(raw))) pairs.push({ key: (m[1] || m[2] || "").trim(), val: m[3] ?? "" });
   const out = [];
-  for (const it of list) {
-    const name = it?.name ?? it?.function?.name ?? it?.tool_name;
-    if (!name || typeof name !== "string") continue;
-    let args = it.arguments ?? it.function?.arguments ?? it.parameters ?? it.args ?? {};
-    if (typeof args === "string") { const p = tryParse(args); if (p) args = p; }
-    out.push(unwrapNested({ name: name.trim(), args }));
+  for (let i = 0; i + 1 < pairs.length; i++) {
+    const a = pairs[i], b = pairs[i + 1];
+    if (a.val.trim() || b.key.toLowerCase() !== "arguments") continue;
+    let args = null;
+    try { args = JSON.parse(b.val); }
+    catch { try { args = JSON.parse(repairJsonLoose(repairInvalidEscapes(b.val))); } catch { continue; } }
+    if (args && typeof args === "object" && !Array.isArray(args) && Object.keys(args).length) {
+      out.push({ name: a.key, args });
+    }
   }
   return out;
 }
@@ -466,7 +782,7 @@ function parseJsonCalls(raw) {
 function parseToolCallBlock(inner, index) {
   const raw = String(inner || "").trim().replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/, "").trim();
   if (!raw) return [];
-  for (const group of [parseHermesCalls(raw), parseInvokeCalls(raw), parseJsonCalls(raw)]) {
+  for (const group of [parseHermesCalls(raw), parseInvokeCalls(raw), parseParameterWrapperCalls(raw), parseJsonCalls(raw)]) {
     if (group.length) return group.map((c, i) => mkToolCall(c.name, c.args, index + i));
   }
   return [];
@@ -507,18 +823,24 @@ function toolCallFailure(inner, { closed = false } = {}) {
 }
 
 class ToolCallExtractor {
-  /** @param {string[]|null} allowedNames 本次请求提供的工具名；给了才启用裸 JSON 识别（避免误吃正文） */
-  constructor(allowedNames = null) {
-    this.pend = ""; this.inCall = false; this.nextIndex = 0;
+  /**
+   * @param {string[]|null} allowedNames 本次请求提供的工具名；给了才启用裸 JSON 识别（避免误吃正文）
+   * @param {(name:string)=>boolean} [canAlias] 幻觉工具名是否可被语义别名兜住；
+   *   给了才对「清单外但可别名」的裸 JSON 也按调用识别（<tool_call> 包裹路径由 normalizer 统一处理）
+   */
+  constructor(allowedNames = null, canAlias = null) {
+    this.pend = ""; this.inCall = false; this.inResp = false; this.nextIndex = 0;
     this.allowed = Array.isArray(allowedNames) && allowedNames.length ? allowedNames : null;
+    this.canAlias = typeof canAlias === "function" ? canAlias : null;
   }
-  /** 名字是否属于本次请求的工具（容忍 tools__ 前缀与大小写） */
+  /** 名字是否属于本次请求的工具（容忍 tools__ 前缀与大小写；可别名兜底的幻觉名也算） */
   _nameOk(name) {
     if (!this.allowed) return false;
     const n = String(name || "").trim();
     if (!n) return false;
     const short = n.replace(/^(?:tools?|functions?)__/i, "").split(/[.:/]/).pop();
-    return this.allowed.some((a) => a === n || a === short || a.toLowerCase() === short.toLowerCase());
+    if (this.allowed.some((a) => a === n || a === short || a.toLowerCase() === short.toLowerCase())) return true;
+    return !!(this.canAlias && this.canAlias(n));
   }
   /** 尝试把缓冲里的裸 JSON 当作工具调用；返回 { events, consumed } 或 null（需等待更多数据） */
   _tryBareJson(final) {
@@ -563,6 +885,17 @@ class ToolCallExtractor {
       rest = rest.replace(/^\s*```/, ""); // 被 ```json 包裹时去掉收尾围栏
       return { events, consumed: end + (this.pend.slice(end).length - rest.length), wait: false };
     }
+    if (!calls.length) {
+      // 裸 JSON 确实命中（BARE_JSON_RE + 名字在清单）却解析失败（畸形/截断）：
+      // 走失败流程给提示 + 空参数补发，绝不把协议残片当正文泄漏
+      const nm = (candidate.match(/"name"\s*:\s*["“”']([^"“”'\s}]+)/) || [])[1];
+      if (nm && this._nameOk(nm)) {
+        const fail = toolCallFailure(candidate, { closed: true });
+        events.push({ type: "text", text: fail.text });
+        events.push({ type: "tool_call", call: mkToolCall(fail.name || nm, {}, this.nextIndex++) });
+        return { events, consumed: end, wait: false };
+      }
+    }
     // 不像工具调用 → 当正文原样吐出这段，继续往后扫
     events.push({ type: "text", text: candidate });
     return { events, consumed: end, wait: false };
@@ -589,6 +922,9 @@ class ToolCallExtractor {
         }
       }
       this.pend = ""; this.inCall = false;
+    } else if (this.inResp) {
+      // 流在伪造的 <tool_response> 块中间结束：整段是幻觉的工具结果，静默吞掉
+      this.pend = ""; this.inResp = false;
     } else if (this.pend) {
       const cleaned = this.pend.replace(STRAY_CLOSE_RE, "");
       if (cleaned) events.push({ type: "text", text: cleaned });
@@ -599,8 +935,49 @@ class ToolCallExtractor {
   _drain(final = false) {
     const events = [];
     while (true) {
+      if (this.inResp) {
+        // 模型伪造的 <tool_response> 块：连同内容整体吞掉（不回显、不当正文）
+        const j = this.pend.indexOf(TR_CLOSE);
+        if (j >= 0) {
+          this.pend = this.pend.slice(j + TR_CLOSE.length);
+          this.inResp = false;
+          continue;
+        }
+        if (final || this.pend.length > 65536) {
+          this.pend = ""; this.inResp = false;
+          return events;
+        }
+        return events; // 等更多数据
+      }
       if (!this.inCall) {
-        const i = this.pend.indexOf(TC_OPEN);
+        const iTC = this.pend.indexOf(TC_OPEN);
+        const iTR = this.pend.indexOf(TR_OPEN);
+        // 裸 JSON 出现在开标签之前（模型把多个调用塞进一个块、或嵌套第二个 <tool_call>）：
+        // 优先走裸 JSON 识别，否则开标签分支会把前面的调用整段当正文吐掉（线上 Windows 样本）
+        if (iTC >= 0 && iTC > 0 && this.allowed && BARE_JSON_RE.test(this.pend.slice(0, iTC))) {
+          const bare = this._tryBareJson(final);
+          if (bare && bare.wait) {
+            const bm = BARE_JSON_RE.exec(this.pend);
+            const before = this.pend.slice(0, bm.index).replace(STRAY_CLOSE_RE, "");
+            if (before) events.push({ type: "text", text: before });
+            this.pend = this.pend.slice(bm.index);
+            return events; // 等更多数据（可能是被切断的裸调用）
+          }
+          if (bare) {
+            for (const e of bare.events) events.push(e);
+            this.pend = this.pend.slice(bare.consumed);
+            continue;
+          }
+        }
+        if (iTR >= 0 && (iTC < 0 || iTR < iTC)) {
+          // 模型复述转录稿：开标签前的正文保留，块本身进入吞噬状态
+          const before = this.pend.slice(0, iTR).replace(STRAY_CLOSE_RE, "");
+          if (before) events.push({ type: "text", text: before });
+          this.pend = this.pend.slice(iTR + TR_OPEN.length);
+          this.inResp = true;
+          continue;
+        }
+        const i = iTC;
         if (i >= 0) {
           // 开标签之前的正文：剥掉孤立闭合标签残骸
           const before = this.pend.slice(0, i).replace(STRAY_CLOSE_RE, "");
@@ -624,7 +1001,7 @@ class ToolCallExtractor {
           continue;
         }
         // 无开标签：保留半截标签、以及可能是裸 JSON 开头的尾巴（否则 '{"name"...' 的首个 '{' 会被当正文吐掉）
-        let keep = final ? 0 : Math.max(tagOverlap(this.pend, TC_OPEN), tagOverlap(this.pend, TC_CLOSE));
+        let keep = final ? 0 : Math.max(tagOverlap(this.pend, TC_OPEN), tagOverlap(this.pend, TC_CLOSE), tagOverlap(this.pend, TR_OPEN));
         if (!final && this.allowed) {
           const lb = this.pend.lastIndexOf("{");
           if (lb >= 0 && this.pend.length - lb <= 40 && !this.pend.slice(lb).includes("}")) {
@@ -751,6 +1128,48 @@ class ThinkingSplitter {
 __internals.parseToolCallBlock = parseToolCallBlock;
 __internals.ToolCallExtractor = ToolCallExtractor;
 __internals.ThinkingSplitter = ThinkingSplitter;
+__internals.aliasTarget = aliasTarget;
+__internals.adaptCallArgsToSchema = adaptCallArgsToSchema;
+__internals.createToolCallNormalizer = createToolCallNormalizer;
+__internals.parseToolChoice = parseToolChoice;
+__internals.renderToolChoiceDirective = renderToolChoiceDirective;
+__internals.renderDialogue = renderDialogue;
+__internals.looksTruncatedStop = looksTruncatedStop;
+__internals.stripLeadEscapes = stripLeadEscapes;
+__internals.continuationDirective = continuationDirective;
+
+/** 模型正文开头偶尔带字面转义残影（"\n\n我将…"）：剥掉开头的字面 \n / \t 序列 */
+const LEAD_ESCAPE_RE = /^(?:\\n|\\t|\s)+/;
+
+function stripLeadEscapes(text) {
+  const m = LEAD_ESCAPE_RE.exec(String(text || ""));
+  return m && m[0].includes("\\") ? String(text).slice(m[0].length) : text;
+}
+
+/**
+ * 疑似「句中提前截断」判定（上游 qwen 偶发自停：finishReason=stop 却停在半句话）。
+ * 保守启发式，宁可漏判不误判：
+ *  - 正文以句读/闭合符结尾 → 视为完整
+ *  - 代码围栏 ``` 数量为奇数 → 必然截断
+ *  - 无句读结尾，且思考量远超正文（长思考后只吐出一小段） → 截断
+ */
+function looksTruncatedStop(content, reasoning) {
+  const body = String(content || "").trim();
+  if (!body) return false;
+  const fences = (body.match(/```/g) || []).length;
+  if (fences % 2 === 1) return true; // 围栏没闭合 → 必然截断
+  if (/[。！？…：；.!?;:）》】」'"`（(]$/.test(body)) return false; // 句读/闭合结尾 → 视为完整
+  return String(reasoning || "").length > 200 && body.length < 120; // 长思考后只吐一小段、无句读 → 截断
+}
+
+/** 续写指令：带上被截断的结尾原文，要求模型原地接着写 */
+function continuationDirective(content) {
+  const tail = String(content || "").trim().slice(-60);
+  return (
+    `\n\n（系统提示：你上一条回复被上游意外截断，你最后输出的是「${tail}」。` +
+    `请从中断处直接继续输出剩余内容：不要重复任何已输出的文字，不要重新开始或另起话题，不要输出任何解释说明。）`
+  );
+}
 
 function lastUserText(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -840,7 +1259,7 @@ function readBody(req, limit = 32 * 1024 * 1024) {
 async function handleChat(req, res, body, deps) {
   const { config, tokens, upstream, log } = deps;
   const t0 = Date.now();
-  let messages, modelObj, dialogue, think, webSearch, stream, sessionId, tools = [];
+  let messages, modelObj, dialogue, think, webSearch, stream, sessionId, tools = [], choice = { forced: "", required: false };
   try {
     const parsed = JSON.parse(body || "{}");
     messages = Array.isArray(parsed.messages) ? parsed.messages : null;
@@ -861,9 +1280,13 @@ async function handleChat(req, res, body, deps) {
     if (Array.isArray(parsed.tools)) {
       tools = parsed.tools.filter((t) => t && (t.function?.name || t.name));
     }
-    if (parsed.tool_choice === "required" && !tools.length) tools = [];
+    choice = parseToolChoice(parsed.tool_choice, tools);
     dialogue = sessionId ? lastUserText(messages) : renderDialogue(messages);
-    if (tools.length) dialogue += renderToolsPrompt(tools);
+    if (tools.length) {
+      dialogue += renderToolsPrompt(tools);
+      const directive = renderToolChoiceDirective(choice);
+      if (directive) dialogue += directive;
+    }
     if (dialogue.length > modelObj.maxInput) {
       throw new UpstreamError(`输入长度 ${dialogue.length} 超过模型上限 ${modelObj.maxInput} 字符`, { status: 400 });
     }
@@ -871,31 +1294,11 @@ async function handleChat(req, res, body, deps) {
     return oaiError(res, e.status || 400, e.message);
   }
 
-  // 模型常给工具名加命名空间前缀或直接吐包装名（tools__CallDeferredTool / tool_call / functions.Read），
-  // 这里按本次请求实际提供的工具清单做归一，避免客户端报 "Tool 'xxx' is not in the allowed list"。
-  const allowedTools = tools.map((t) => t?.function?.name).filter((n) => typeof n === "string" && n);
-  const allowedLower = new Map(allowedTools.map((n) => [n.toLowerCase(), n]));
-  const normalizeToolCall = (call) => {
-    const fn = call?.function;
-    if (!fn) return null;
-    let name = String(fn.name || "").trim();
-    if (!name) return null;
-    if (!allowedTools.length || allowedTools.includes(name)) return call;
-    const candidates = [
-      name.replace(/^(?:tools?|functions?)__/i, ""),           // tools__CallDeferredTool → CallDeferredTool
-      name.split(/[.:/]/).pop(),                                // functions.Read → Read
-      name.replace(/^(?:tools?|functions?)[._-]/i, ""),
-    ];
-    for (const c of candidates) {
-      if (!c) continue;
-      if (allowedTools.includes(c)) { fn.name = c; return call; }
-      const hit = allowedLower.get(c.toLowerCase());
-      if (hit) { fn.name = hit; return call; }
-    }
-    const tail = allowedTools.find((t) => t.toLowerCase().endsWith(name.split(/[.:/]/).pop().toLowerCase()));
-    if (tail) { fn.name = tail; return call; }
-    return call; // 未命中就原样放行，让客户端明确报错而不是静默丢调用
-  };
+  // 模型常给工具名加命名空间前缀、吐包装名，甚至幻觉出清单外的名字（bash / read_file…），
+  // 这里按本次请求实际提供的工具清单做归一（含语义别名 + 参数键适配），
+  // 避免客户端报 "Tool 'xxx' is not in the allowed list" 并中断 agent 循环。
+  const { normalize: normalizeToolCall, allowedTools } = createToolCallNormalizer(tools, { log });
+  const canAlias = (name) => !!aliasTarget(String(name || "").trim(), allowedTools);
 
   // 缓存命中估算（前缀复用）：必须在本轮调用前算，并把本轮 prompt 记为下轮基准。
   // 可缓存前缀 < 1024 token 时百炼不会建立缓存 → 上报 0，避免假命中。
@@ -983,8 +1386,9 @@ async function handleChat(req, res, body, deps) {
   try {
     if (!stream) {
       let toolCallsOut = [];
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const opts = attempt === 0 ? chatOpts : { ...chatOpts, dialogue: dialogue + NUDGE_TEXT };
+      let attemptDialogue = dialogue;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const opts = { ...chatOpts, dialogue: attemptDialogue };
         for await (const ev of upstream.chat(opts)) {
           collect(ev);
           armIdle();
@@ -992,22 +1396,37 @@ async function handleChat(req, res, body, deps) {
         // 把写进正文的 <thinking> 拆到 reasoning，正文才算"真输出"
         const sp = new ThinkingSplitter();
         const spell = [...sp.feed(content), ...sp.flush()];
-        content = spell.filter((e) => e.type === "content").map((e) => e.text).join("");
+        content = stripLeadEscapes(spell.filter((e) => e.type === "content").map((e) => e.text).join(""));
         reasoning += spell.filter((e) => e.type === "reasoning").map((e) => e.text).join("");
         // 工具调用提取（非流式）：从全文中提取 <tool_call> 块转为结构化 tool_calls
         toolCallsOut = [];
         if (tools.length) {
-          const extractor = new ToolCallExtractor(allowedTools);
+          const extractor = new ToolCallExtractor(allowedTools, canAlias);
           const events = [...extractor.feed(content), ...extractor.flush()];
           content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
           toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
           toolCallCount = toolCallsOut.length;
         }
+        // tool_choice 强制但模型只回了文字：非流式尚未出网，丢弃后带更强指令重试一次
+        if (attempt === 0 && choice.required && tools.length && !toolCallsOut.length) {
+          log("[chat] tool_choice 强制但未发起工具调用，丢弃纯文字回复并重试一次");
+          content = "";
+          reasoning = "";
+          attemptDialogue = dialogue + "\n\n（系统提示：你上一轮没有发起工具调用，违反了强制要求。本轮必须首先输出 <tool_call> 块调用工具，不要再输出任何纯文字内容。）";
+          continue;
+        }
+        // 句中截断（长思考后短正文、无句读结尾 / 围栏未闭合）：自动续写并拼回同一份回复
+        if (attempt < 2 && !toolCallsOut.length && looksTruncatedStop(content, reasoning)) {
+          log(`[chat] 疑似句中截断（思考 ${reasoning.length} 字 / 正文 ${content.trim().length} 字、无句读结尾），自动续写`);
+          attemptDialogue = dialogue + continuationDirective(content);
+          continue;
+        }
         // 只吐出思考 / 什么都没吐，且本可以用工具 → 续写一次，避免 agent 轮次被掐断
         const produced = content.trim() || toolCallsOut.length;
-        if (produced || !tools.length || attempt === 1) break;
+        if (produced || !tools.length || attempt === 2) break;
         log("[chat] 空回复（只有思考），自动续写一次");
         content = "";
+        attemptDialogue = dialogue + NUDGE_TEXT;
       }
       clearTimers();
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", ...(sidOut ? { "x-139-session-id": sidOut } : {}) });
@@ -1038,7 +1457,7 @@ async function handleChat(req, res, body, deps) {
     res.write(`data: ${JSON.stringify(baseChunk({ role: "assistant", content: "" }))}\n\n`);
 
     // 工具调用提取（流式）：正文经 ToolCallExtractor，<tool_call> 块转结构化 delta.tool_calls
-    const extractor = tools.length ? new ToolCallExtractor(allowedTools) : null;
+    const extractor = tools.length ? new ToolCallExtractor(allowedTools, canAlias) : null;
     let sawToolCall = false;
     const emitTextEvents = (events) => {
       for (const e of events) {
@@ -1056,6 +1475,7 @@ async function handleChat(req, res, body, deps) {
 
     let citationsSent = false;
     const splitter = new ThinkingSplitter();
+    let leadStripped = false; // 首段正文的字面 "\n\n" 转义残影只剥一次
     // 把 <thinking> 写进正文的情况拆出来：思考走 reasoning_content，正文才参与工具解析
     const applySplit = (se) => {
       if (se.type === "reasoning") {
@@ -1063,14 +1483,19 @@ async function handleChat(req, res, body, deps) {
         res.write(`data: ${JSON.stringify(baseChunk({ reasoning_content: se.text }))}\n\n`);
         return;
       }
+      if (!leadStripped) {
+        const stripped = stripLeadEscapes(se.text);
+        if (stripped !== se.text) se = { ...se, text: stripped };
+        if (se.text.trim()) leadStripped = true;
+      }
       content += se.text;
       if (extractor) emitTextEvents(extractor.feed(se.text));
-      else res.write(`data: ${JSON.stringify(baseChunk({ content: se.text }))}\n\n`);
+      else if (se.text) res.write(`data: ${JSON.stringify(baseChunk({ content: se.text }))}\n\n`);
     };
     const feedOut = (txt) => { for (const se of splitter.feed(txt)) applySplit(se); };
 
     let attemptDialogue = dialogue;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const contentAtStart = content.length;
       const callsAtStart = toolCallCount;
       for await (const ev of upstream.chat({ ...chatOpts, dialogue: attemptDialogue })) {
@@ -1092,7 +1517,13 @@ async function handleChat(req, res, body, deps) {
       for (const se of splitter.flush()) applySplit(se); // 冲出本轮残留（未闭合思考按 reasoning 处理）
       splitter.reset(); // 下一轮是独立请求，不能沿用未闭合的 <thinking> 状态
       const produced = content.length > contentAtStart || toolCallCount > callsAtStart;
-      if (produced || !tools.length || attempt === 1) break;
+      // 句中截断：在同一个 SSE 流里向上游追加一轮"从中断处继续"，客户端看到连续回复
+      if (produced && attempt < 2 && toolCallCount === callsAtStart && looksTruncatedStop(content, reasoning)) {
+        log(`[chat] 疑似句中截断（思考 ${reasoning.length} 字 / 正文 ${content.trim().length} 字、无句读结尾），自动续写`);
+        attemptDialogue = dialogue + continuationDirective(content);
+        continue;
+      }
+      if (produced || !tools.length || attempt === 2) break;
       attemptDialogue = dialogue + NUDGE_TEXT;
       log("[chat] 空回复（只有思考），自动续写一次");
     }
