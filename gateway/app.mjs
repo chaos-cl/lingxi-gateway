@@ -110,6 +110,9 @@ export function createGateway(opts = {}) {
   // 单次请求随对话送达的图片上限：agent 客户端（如 zcode）会把历史里的所有截图每轮重发，
   // 上游对超量 fileList 直接报「参数错误」——只保留最近的若干张（最早的截图对当前轮次价值最低）
   const IMAGE_MAX_PER_REQUEST = 6;
+  // 上游多模态路径的总预算实测（2026-11-07，55 万字符文本 + 6 图 OK；60 万 + 任意图片必拒「参数错误」；
+  // 纯文本路径是 80 万字符）：对话超过该长度时省略图片按纯文本继续
+  const IMAGE_MAX_DIALOGUE_CHARS = 500000;
   const mcloudHeaders = (basic) => ({
     // 头集合与 webui 实抓对齐；x-yun-client-info 为必需头（缺失会被 hcy 判 04000003「请求头不合法」）
     Accept: "application/json, text/plain, */*",
@@ -1594,6 +1597,14 @@ async function handleChat(req, res, body, deps) {
         imageMetas.push(await uploadImage({ buffer, mime, name }));
       }
       log(`[chat] 图片上传 ${imageMetas.length} 张${imageDropped ? `（历史共 ${uniq.length} 张，超出上限丢弃最早 ${imageDropped} 张）` : ""}：${imageMetas.map((i) => `${i.name}(${Math.round(i.size / 1024)}KB)`).join(", ")}`);
+      // 上游多模态总预算：对话过长时图片必被拒（参数错误）——主动省略并给模型留透明提示
+      if (imageMetas.length && dialogue.length > IMAGE_MAX_DIALOGUE_CHARS) {
+        const omitted = imageMetas.length;
+        imageMetas = [];
+        imageDropped += omitted;
+        dialogue += `\n\n（系统提示：本次对话内容过长（${dialogue.length} 字符），消息中附带的 ${omitted} 张图片未能随本次请求送达，请基于文字内容继续；若视觉信息必不可少，请让用户缩短对话后重发。）`;
+        log(`[chat] 对话 ${dialogue.length} 字符超多模态预算（${IMAGE_MAX_DIALOGUE_CHARS}），省略 ${omitted} 张图片按纯文本继续`);
+      }
     } catch (e) {
       imageError = String(e.message || e).slice(0, 200);
       log(`[chat] 图片上传失败，按纯文本继续：${imageError}`);

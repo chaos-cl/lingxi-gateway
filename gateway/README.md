@@ -74,7 +74,8 @@ curl http://127.0.0.1:8317/v1/chat/completions -H "Content-Type: application/jso
 - 图片自动上传 139 云盘（`hcy/file` 三步协议：create → 预签名 PUT → complete），**sha256 去重**：同一张图多轮 agent 循环重发零上传开销，平台侧 contentHash 秒传兜底
 - 上传失败自动**降级为纯文本**继续对话（原因写入会话日志 `imageError`）
 - qwen3.8-Max / qwen3.8-Flash 等模型原生多模态，无需切换到 Seed-2.0-Lite（webui 实测 Max 直接识图）
-- 单张上限 20MB；多图按 fileList 顺序随消息送达
+- 单张上限 20MB；多图按 fileList 顺序随消息送达，**单次请求最多 6 张**（agent 客户端每轮重发全量历史截图时只保留最近 6 张，`imagesDropped` 入会话日志）
+- **上游多模态总预算**：对话文本 ≤50 万字符时图片正常送达；超长对话（实测 60 万字符 + 任意图片必被上游拒「参数错误」，纯文本上限是 80 万）会自动省略图片并在对话里给模型留提示，超长 agent 会话中的识图请求需要缩短对话后重试
 
 ### POST /v1/chat/completions
 
