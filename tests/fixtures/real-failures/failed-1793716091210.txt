@@ -1,0 +1,7 @@
+
+<parameter=ExecCommand>
+</parameter>
+<parameter=arguments>
+{"cmd":"$ErrorActionPreference='Stop'; $cfg=Join-Path $env:LOCALAPPDATA 'dosbox-automation\\dosbox-automation.conf'; Copy-Item $cfg ($cfg+'.pre-fpds.bak') -Force; $g='E:\\bf\\OLDSSD500\\炎龙骑士团外传风之纹章'; $fso=New-Object -ComObject Scripting.FileSystemObject; $sp=$fso.GetFolder($g).ShortPath; Write-Output ('SHORT_PATH='+$sp); Write-Output ('HAS_SPACE='+($sp -match ' ')); $t=Get-Content $cfg -Raw; $t=$t -replace '(?m)^webserver_enabled = .*$','webserver_enabled = true'; $t=$t -replace '(?m)^webserver_token_file = .*$','webserver_token_file = true'; if($t -notmatch 'MOUNT C '){ $t=$t.TrimEnd()+\"`r`n\"+'MOUNT C '+$sp+\"`r`nC:`r`nFDPS.EXE`r`n\" }; [System.IO.File]::WriteAllText($cfg,$t,[System.Text.UTF8Encoding]::new($false)); Select-String -Path $cfg -Pattern '^webserver_enabled|^webserver_token_file|^MOUNT C|^C:|^FDPS|^mount_allowed_bases' | ForEach-Object { [string]::Format('L{0}: {1}', $_.LineNumber, $_.Line) }", "yield_time_ms": 20000}
+</parameter>
+</function>

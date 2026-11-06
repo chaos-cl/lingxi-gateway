@@ -224,6 +224,8 @@ function renderToolsPrompt(tools) {
     '<tool_call>\n{"name": "工具名", "arguments": {"参数名": 参数值}}\n</tool_call>\n' +
     "上述 JSON 必须严格合法：arguments 里字符串值内部的引号必须用反斜杠转义（\\\"）。例如 shell 命令：\n" +
     '<tool_call>\n{"name": "ExecCommand", "arguments": {"cmd": "grep \\"foo\\" file.txt"}}\n</tool_call>\n' +
+    "需要连续调用多个工具时，每个调用必须用自己完整的 <tool_call>…</tool_call> 块包裹：不要省略中间的闭合标签，也不要在一个块内嵌套第二个 <tool_call>。\n" +
+    "参数值里包含 Windows 路径或注册表键名时，反斜杠必须双写（如 \"C:\\\\Users\\\\x\"）；JSON 结构本身的引号（键名、分隔符）不要转义。\n" +
     "工具执行结果将以 <tool_response> 块返回给你，根据结果继续回答或再次调用。\n" +
     "单次工具调用的参数体积请控制在 6000 字符以内：大文件先写骨架，再用 Edit 分段补全（上游单次输出长度有限，过长会被截断）。\n" +
     "注意：JSON 的引号必须是半角 ASCII 双引号 \" ，不要用中文引号“”，冒号逗号也用半角 : , ，否则解析会失败。\n" +
@@ -526,13 +528,14 @@ function parseXmlParams(body) {
   for (let i = 0; i < marks.length; i++) {
     const end = i + 1 < marks.length ? marks[i + 1].tagStart : body.length; // 值止于下一个标签的起始 '<'
     let val = body.slice(marks[i].start, end);
-    val = val
-      .replace(/<\/parameter>\s*$/i, "")
-      .replace(/<\/function>\s*$/i, "")
-      .replace(/<\/invoke>\s*$/i, "")
-      .replace(/<\/tool_call>\s*$/i, "")
-      .replace(/^\r?\n/, "")
-      .replace(/\s+$/, "");
+    // 逐层剥掉尾部堆叠的闭合标签（</parameter>\n</function> 这种）——
+    // 链式单次替换会漏掉先被上层标签"曝光"出来的内层闭合标签，导致参数值粘上 </parameter> 残骸
+    let prev;
+    do {
+      prev = val;
+      val = val.replace(/(?:<\/parameter>|<\/function>|<\/invoke>|<\/tool_call>)\s*$/i, "");
+    } while (val !== prev);
+    val = val.replace(/^\r?\n/, "").replace(/\s+$/, "");
     if (marks[i].key) args[marks[i].key] = val;
   }
   return args;
@@ -608,6 +611,40 @@ function repairSmartQuotes(s) {
     out += c; // 正文中的“引号”保留
   }
   return out;
+}
+
+/**
+ * 过度转义修复：模型把 JSON 结构引号也转义了（PowerShell 嵌套引号场景），
+ * 如 `Sort-Object\",\"description\":\"List ...\"}}`。
+ *   - 字符串内 `\"` 且其后（跳过空白）是 , } ] → 视为字符串真正的结束符；
+ *   - 字符串外 `\"` → 还原为结构引号。
+ */
+function repairOverEscapedQuotes(s) {
+  let out = "", inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inStr) {
+      if (c === "\\" && s[i + 1] === '"') { out += '"'; i++; continue; }
+      if (c === '"') inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === "\\" && s[i + 1] === '"') {
+      let j = i + 2;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      const n = s[j];
+      if (n === "," || n === "}" || n === "]") { out += '"'; inStr = false; i++; continue; }
+      out += '\\"'; i++; continue;
+    }
+    if (c === '"') { inStr = false; out += c; continue; }
+    out += c;
+  }
+  return out;
+}
+
+/** 字符串值忘写引号修复（"description":裸文字, 形态）：值以字母开头时补上引号。兜底变体。 */
+function repairUnquotedValue(s) {
+  return s.replace(/(:\s*)([A-Za-z][^"{}\[\]\n]*?)"(?=\s*[,}\]])/g, (_m, p1, p2) => `${p1}"${p2}"`);
 }
 
 /** 全角标点 → 半角（只在字符串外转换，结构位置的 ：，｛｝ 会让 JSON 直接失败） */
@@ -688,7 +725,7 @@ function repairInvalidEscapes(s) {
   return out;
 }
 
-/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 非法转义 / 裸换行 / 尾逗号 / 未转义引号 / 结构补全） */
+/** JSON 客体/数组：依次尝试渐进式修复（弯引号 / 全角标点 / 非法转义 / 裸换行 / 尾逗号 / 未转义引号 / 过度转义 / 忘写值引号 / 结构补全） */
 function parseJsonCalls(raw) {
   const tryParse = (s) => {
     const variants = [];
@@ -708,6 +745,9 @@ function parseJsonCalls(raw) {
     add(repairUnescapedQuotes(loose));
     add(repairUnescapedQuotes(repairJsonLoose(s))); // 不走弯引号修复的兜底
     add(autoCloseJson(loose));                       // 只差右括号：补全后通常能拿到完整参数
+    add(repairInvalidEscapes(loose));                // Windows 裸反斜杠路径（E:\bf\...，模型忘写双反斜杠）
+    add(repairOverEscapedQuotes(loose));             // 结构引号被过度转义（PowerShell 嵌套引号场景）
+    add(repairUnquotedValue(loose));                 // 字符串值忘写引号（"description":裸文字）
     for (const v of variants) {
       try { return JSON.parse(v); } catch { /* 继续尝试 */ }
     }
@@ -856,7 +896,8 @@ class ToolCallExtractor {
         // 流已结束仍不闭合 → 按"少右括号/被截断"处理：能补全就补，补不出就给空参数补发
         const tailRaw = this.pend.slice(start);
         const closed = autoCloseJson(repairSmartQuotes(tailRaw));
-        const fixed = closed ? parseToolCallBlock(closed, this.nextIndex) : [];
+        // 能补全就走补全；补不出也把原始尾巴过一遍完整修复链（平衡但非法的 JSON 可能在这一步被救回）
+        const fixed = closed ? parseToolCallBlock(closed, this.nextIndex) : parseToolCallBlock(repairSmartQuotes(tailRaw), this.nextIndex);
         const events2 = [];
         const before2 = this.pend.slice(0, start).replace(/```(?:json)?\s*$/i, "");
         if (before2) events2.push({ type: "text", text: before2 });
@@ -1340,7 +1381,7 @@ async function handleChat(req, res, body, deps) {
   // usage 块（所有返回路径共用）：带缓存字段，供客户端统计命中率
   const usageBlock = () => {
     const promptTokens = estTokensText(dialogue);
-    const completionTokens = estTokensText(content) + estTokensText(reasoning);
+    const completionTokens = estTokensText(content) + estTokensText(reasoning) + Math.ceil(toolChars / 3.5);
     return {
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
@@ -1354,6 +1395,7 @@ async function handleChat(req, res, body, deps) {
   const usageSource = "estimated"; // 上游不返回计量，token 与缓存命中均为估算（见 README「token 用量与缓存命中」）
   let content = "", reasoning = "", modelUsed = "", sidOut = "", statement = "", citations = [];
   let toolCallCount = 0;
+  let toolChars = 0; // 工具调用（名字+参数 JSON）的字符数：计入 completion 用量，否则带工具的轮次 completion=0、TPS 显示为 0
   let lastFinish = "";
   // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
   const finalize = () => {
@@ -1406,6 +1448,7 @@ async function handleChat(req, res, body, deps) {
           content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
           toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
           toolCallCount = toolCallsOut.length;
+          toolChars += toolCallsOut.reduce((n, c) => n + (c.function?.name?.length || 0) + (c.function?.arguments?.length || 0), 0);
         }
         // tool_choice 强制但模型只回了文字：非流式尚未出网，丢弃后带更强指令重试一次
         if (attempt === 0 && choice.required && tools.length && !toolCallsOut.length) {
@@ -1468,6 +1511,7 @@ async function handleChat(req, res, body, deps) {
           if (!call) continue;
           sawToolCall = true;
           toolCallCount++;
+          toolChars += (call.function?.name?.length || 0) + (call.function?.arguments?.length || 0);
           res.write(`data: ${JSON.stringify(baseChunk({ tool_calls: [call] }))}\n\n`);
         }
       }
