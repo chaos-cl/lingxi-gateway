@@ -32,7 +32,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { loadConfig, GATEWAY_DIR } from "./config.mjs";
 import { TokenManager } from "./token.mjs";
-import { Upstream, UpstreamError } from "./upstream.mjs";
+import { Upstream, UpstreamError, UA } from "./upstream.mjs";
 import { MODELS, resolveModel, openaiModels } from "./models.mjs";
 import { recordUsage, setUsageDir } from "./usage.mjs";
 import { createAdminApi } from "./admin.mjs";
@@ -94,6 +94,141 @@ export function createGateway(opts = {}) {
     cacheFile: path.join(DATA_SUBDIR, "token.json"),
   });
   const upstream = new Upstream(tokens);
+
+  /* ---------------- 视觉支持：OpenAI image_url → 139 云盘 → attachment ----------------
+   * 协议来自 webui 实抓（2026-11-07）：
+   *   1. POST personal-kd-njs.yun.139.com/hcy/file/create 建目录链 /AI空间/灵犀互动记录/本地上传
+   *      （fileRenameMode=refuse 幂等，exist:true 即已存在）—— 鉴权与 AI API 同一个 Basic token
+   *   2. POST /hcy/file/create 建文件条目（sha256 + partInfos）→ data.exist=true 为秒传命中，
+   *      直接用 data.fileId；否则拿 data.uploadId + partInfos[].uploadUrl（AWS SigV4 预签名）
+   *      PUT 原始字节后 POST /hcy/file/complete
+   *   3. 聊天体：command {command:"036",subCommand:"036006"} + attachment {attachmentTypeList:[3],
+   *      fileList:[{fileId,parentFileId,name,type:"file",size}]}，qwen3.8-Max 等模型原生识图
+   */
+  const MCLOUD_BASE = "https://personal-kd-njs.yun.139.com";
+  const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+  const mcloudHeaders = (basic) => ({
+    // 头集合与 webui 实抓对齐；x-yun-client-info 为必需头（缺失会被 hcy 判 04000003「请求头不合法」）
+    Accept: "application/json, text/plain, */*",
+    Authorization: basic,
+    "Content-Type": "application/json;charset=UTF-8",
+    "INNER-HCY-ROUTER-HTTPS": "1",
+    "mcloud-channel": "1000101",
+    "mcloud-client": "10904",
+    "mcloud-network": "102",
+    "mcloud-skey": "",
+    "mcloud-version": "2.0.0",
+    "User-Agent": UA,
+    "x-DeviceInfo": "||||chrome|152.0.7977.130|||windows 10||zh-CN|||",
+    "x-NetType": "4",
+    "x-huawei-channelSrc": "10254500",
+    "x-inner-ntwk": "2",
+    "x-yun-api-version": "v1",
+    "x-yun-app-channel": "10175",
+    "x-yun-client-info": "||||chrome|152.0.7977.130|||windows 10||zh-CN|||",
+    "x-yun-tid": crypto.randomUUID(),
+    Origin: "https://appmail10.mail.10086.cn",
+    Referer: "https://appmail10.mail.10086.cn/",
+  });
+  const uploadFolderId = { id: null };
+  const uploadedImages = new Map(); // sha256 → { fileId, parentFileId, name, size }（同图去重：agent 循环每轮都重发图片，秒传靠这条缓存 + 平台 contentHash 去重）
+  async function ensureUploadFolder() {
+    if (uploadFolderId.id) return uploadFolderId.id;
+    const { basic } = await tokens.get();
+    let parent = "/";
+    for (const name of ["AI空间", "灵犀互动记录", "本地上传"]) {
+      const res = await fetch(MCLOUD_BASE + "/hcy/file/create", {
+        method: "POST",
+        headers: mcloudHeaders(basic),
+        body: JSON.stringify({ parentFileId: parent, name, type: "folder", fileRenameMode: "refuse" }),
+      });
+      const j = await res.json().catch(() => null);
+      if (!j || j.code !== "0000" || !j.data?.fileId) {
+        throw new UpstreamError(`云盘目录创建失败（${name}）：${j ? JSON.stringify(j).slice(0, 150) : "HTTP " + res.status}`, { status: 502 });
+      }
+      parent = j.data.fileId;
+    }
+    uploadFolderId.id = parent;
+    return parent;
+  }
+  async function uploadImage({ buffer, mime, name }) {
+    const hash = crypto.createHash("sha256").update(buffer).digest("hex");
+    const hit = uploadedImages.get(hash);
+    if (hit) return hit;
+    const { basic } = await tokens.get();
+    const parentId = await ensureUploadFolder();
+    const createRes = await fetch(MCLOUD_BASE + "/hcy/file/create", {
+      method: "POST",
+      headers: mcloudHeaders(basic),
+      body: JSON.stringify({
+        fileRenameMode: "auto_rename",
+        contentType: "application/oct-stream",
+        type: "file",
+        name, size: buffer.length,
+        contentHashAlgorithm: "sha256",
+        contentHash: hash,
+        partInfos: [{ parallelHashCtx: { partOffset: 0 }, partNumber: 1, partSize: buffer.length }],
+        parentFileId: parentId,
+      }),
+    });
+    const create = await createRes.json().catch(() => null);
+    if (!create || create.code !== "0000" || !create.data?.fileId) {
+      throw new UpstreamError(`图片上传失败（create）：${create ? JSON.stringify(create).slice(0, 150) : "HTTP " + createRes.status}`, { status: 502 });
+    }
+    const meta = create.data;
+    if (!(meta.exist && meta.fileId)) {
+      // 秒传未命中：单分片直传（presigned URL 自带签名，无需鉴权头）→ complete
+      const part = (meta.partInfos || [])[0];
+      if (!meta.uploadId || !part?.uploadUrl) throw new UpstreamError("图片上传失败（create 未返回 uploadId/uploadUrl）", { status: 502 });
+      const put = await fetch(part.uploadUrl, { method: "PUT", body: buffer, headers: { "Content-Type": "application/oct-stream" } });
+      if (!put.ok) throw new UpstreamError(`图片上传失败（对象存储 PUT ${put.status}）`, { status: 502 });
+      const completeRes = await fetch(MCLOUD_BASE + "/hcy/file/complete", {
+        method: "POST",
+        headers: mcloudHeaders(basic),
+        body: JSON.stringify({ fileId: meta.fileId, uploadId: meta.uploadId, contentHash: hash, contentHashAlgorithm: "sha256" }),
+      });
+      const complete = await completeRes.json().catch(() => null);
+      if (!complete || complete.code !== "0000") {
+        throw new UpstreamError(`图片上传失败（complete）：${complete ? JSON.stringify(complete).slice(0, 150) : "HTTP " + completeRes.status}`, { status: 502 });
+      }
+    }
+    const out = { fileId: meta.fileId, parentFileId: meta.parentFileId || parentId, name: meta.fileName || name, size: buffer.length };
+    uploadedImages.set(hash, out);
+    if (uploadedImages.size > 64) uploadedImages.delete(uploadedImages.keys().next().value);
+    return out;
+  }
+  /** OpenAI 图片 URL → { buffer, mime, ext }：支持 data:base64 与 https 下载 */
+  async function decodeImageUrl(url) {
+    const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(String(url || "").replace(/\s+/g, ""));
+    if (m) {
+      const buffer = Buffer.from(m[2], "base64");
+      return { buffer, mime: m[1].toLowerCase(), ext: (m[1].split("/")[1] || "png").toLowerCase().replace("jpeg", "jpg") };
+    }
+    if (/^https:\/\//i.test(url)) {
+      const res = await fetch(url);
+      if (!res.ok) throw new UpstreamError(`图片下载失败（HTTP ${res.status}）`, { status: 400 });
+      const mime = (res.headers.get("content-type") || "image/png").split(";")[0].toLowerCase();
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const extFromUrl = (/\.([a-z0-9]{2,5})(?:[?#]|$)/i.exec(url) || [])[1];
+      return { buffer, mime, ext: (extFromUrl || mime.split("/")[1] || "png").toLowerCase().replace("jpeg", "jpg") };
+    }
+    throw new UpstreamError("不支持的 image_url（仅支持 data:base64 与 https://）", { status: 400 });
+  }
+  /** 从 messages 里提取 OpenAI 视觉图片；stateless 多轮取全部 user 消息（去重后上传很便宜），会话模式只取最后一条 */
+  function extractImageUrls(msgs, lastOnly) {
+    const users = msgs.filter((m) => m.role === "user");
+    const scope = lastOnly ? users.slice(-1) : users;
+    const out = [];
+    for (const m of scope) {
+      if (!Array.isArray(m.content)) continue;
+      for (const p of m.content) {
+        if (p?.type !== "image_url") continue;
+        const url = typeof p.image_url === "string" ? p.image_url : p.image_url?.url;
+        if (url) out.push(url);
+      }
+    }
+    return out;
+  }
 
   const log = (line) => {
     console.log(line);
@@ -1431,6 +1566,29 @@ async function handleChat(req, res, body, deps) {
   const clearTimers = () => { clearTimeout(hardTimer); if (idleTimer) clearTimeout(idleTimer); };
   armIdle();
 
+  // 视觉：提取 OpenAI image_url → 上传云盘（sha256 去重/秒传）→ attachment。
+  // 上传失败降级为纯文本对话（图片部分丢弃但流程不中断），并把原因写进会话日志
+  let imageMetas = [], imageError = "";
+  const rawImageUrls = extractImageUrls(messages, !!sessionId);
+  if (rawImageUrls.length) {
+    try {
+      let idx = 0;
+      for (const url of rawImageUrls) {
+        idx++;
+        const { buffer, mime, ext } = await decodeImageUrl(url);
+        if (buffer.length > IMAGE_MAX_BYTES) throw new UpstreamError(`图片超过 ${Math.round(IMAGE_MAX_BYTES / 1048576)}MB 上限（${buffer.length} 字节）`, { status: 400 });
+        if (!buffer.length) throw new UpstreamError("图片内容为空", { status: 400 });
+        const name = `gateway-${Date.now()}-${idx}.${ext}`;
+        imageMetas.push(await uploadImage({ buffer, mime, name }));
+      }
+      log(`[chat] 图片上传 ${imageMetas.length} 张：${imageMetas.map((i) => `${i.name}(${Math.round(i.size / 1024)}KB)`).join(", ")}`);
+    } catch (e) {
+      imageError = String(e.message || e).slice(0, 200);
+      log(`[chat] 图片上传失败，按纯文本继续：${imageError}`);
+      imageMetas = [];
+    }
+  }
+
   const chatOpts = {
     model: modelObj.id,
     think,
@@ -1438,6 +1596,7 @@ async function handleChat(req, res, body, deps) {
     sessionId: String(sessionId),
     webSearch,
     signal: abort.signal,
+    images: imageMetas,
   };
 
   const id = "chatcmpl-139-" + crypto.randomUUID().slice(0, 8);
@@ -1471,6 +1630,7 @@ async function handleChat(req, res, body, deps) {
     sessionId: String(sessionId),
     toolNames: allowedTools, toolChoice: choice,
     promptChars: dialogue.length,
+    images: [], // 上传成功的图片附件（fileId/name/size）；imageError 记录降级原因
     dialogue, // 完整上游输入（渲染后的对话 + 工具说明）
     rounds: [], // 每次 /chat/v2/add 往返一条：{ kind, note, out, reasoning, finish, ms }
   };
@@ -1491,6 +1651,10 @@ async function handleChat(req, res, body, deps) {
     curRound = null;
   };
   const sessToolCalls = []; // 最终下发给客户端的 tool_calls（流式在 emit 时收，非流式在提取后收）
+  if (sess) {
+    sess.images = imageMetas.map((i) => ({ name: i.name, fileId: i.fileId, size: i.size }));
+    if (imageError) sess.imageError = imageError;
+  }
 
   // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
   const finalize = () => {

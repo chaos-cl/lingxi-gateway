@@ -57,6 +57,25 @@ OpenAI 格式模型列表。模型名同时接受 `id`（如 `blian_qwen38_max`�
 | jiutian | 九天大模型 | 9k | ✗ |
 | vlm_huoshan_2_0_lite_thinking_vision | Seed-2.0-Lite | 40k | ✓（视觉） |
 
+### 视觉（图片识别）
+
+OpenAI 标准视觉格式（`content` 数组 + `image_url`，支持 `data:base64` 与 `https://`）：
+
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "qwen3.8-Max",
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "图片里有什么？"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+  ]}]
+}'
+```
+
+- 图片自动上传 139 云盘（`hcy/file` 三步协议：create → 预签名 PUT → complete），**sha256 去重**：同一张图多轮 agent 循环重发零上传开销，平台侧 contentHash 秒传兜底
+- 上传失败自动**降级为纯文本**继续对话（原因写入会话日志 `imageError`）
+- qwen3.8-Max / qwen3.8-Flash 等模型原生多模态，无需切换到 Seed-2.0-Lite（webui 实测 Max 直接识图）
+- 单张上限 20MB；多图按 fileList 顺序随消息送达
+
 ### POST /v1/chat/completions
 
 完全兼容 OpenAI 格式：

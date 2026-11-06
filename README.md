@@ -25,6 +25,7 @@ OpenBitFun / OpenAI SDK / Claude Code / Cherry Studio …
 | 🔌 **OpenAI 全兼容** | `/v1/models`、`/v1/chat/completions`（流式 / 非流式），任意支持自定义 Base URL 的客户端直接接入 |
 | 🧠 **深度思考** | 自动归一化 `enable_thinking` / `thinking:{type}` / `reasoning_effort` 三种客户端风格，思考流映射为 `delta.reasoning_content` |
 | 🛠 **工具调用（function calling）** | 139 上游无原生支持 → 网关以 qwen HERMES 文本协议模拟，含流式状态机（跨 chunk 标签、未转义引号抢救、多余闭合标签剥离），Agent 场景可直接跑 |
+| 🖼 **视觉（图片识别）** | OpenAI 标准视觉格式（`image_url`，data:base64 / https）→ 图片自动传 139 云盘（sha256 去重+秒传）→ `attachment` 附件送达模型；qwen3.8-Max 原生多模态直接识图 |
 | 📊 **TPS / 用量上报** | 流式响应无条件携带 `usage` 块，客户端（如 OpenBitFun）可直接显示 token 用量、输出速度与**缓存命中率**（上游不提供计量，网关按前缀复用估算并标记来源） |
 | 👤 **账号连接** | 桌面版内置登录助手：App 内登录 139 邮箱 → 自动读取 httpOnly cookie → 验证铸造 → 保存，**无需手工导出凭据** |
 | ♻️ **自动续期** | Token 约 25 天有效，到期前 1 天自动重铸；支持一键手动续期与会话过期提醒 |

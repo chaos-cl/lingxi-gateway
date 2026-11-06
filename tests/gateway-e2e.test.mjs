@@ -26,14 +26,22 @@ const MINT = JSON.stringify({ code: "S_OK", var: { data: { data: { account: "hy0
 let script = [];       // 每次 /chat/v2/add 依次取一条输出文本
 let chatCalls = 0;
 let seenDialogues = [];
+let seenAttachments = []; // chat/v2/add 的 attachment/command（视觉用例断言）
 
 globalThis.fetch = async (url, init = {}) => {
   const u = String(url);
   if (u.includes("queryUserToken")) return new Response(MINT, { headers: { "content-type": "application/json" } });
   if (u.includes("/chat/config")) return new Response(JSON.stringify({ success: true }), { headers: { "content-type": "application/json" } });
+  if (u.includes("/hcy/file/create")) {
+    const body = JSON.parse(init.body || "{}");
+    if (body.type === "folder") return new Response(JSON.stringify({ code: "0000", data: { fileId: "dir-" + body.name, exist: true } }), { headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ code: "0000", data: { fileId: "img-stub-1", parentFileId: "dir-本地上传", fileName: body.name, exist: true } }), { headers: { "content-type": "application/json" } });
+  }
+  if (u.includes("/hcy/file/complete")) return new Response(JSON.stringify({ code: "0000", data: { fileId: "img-stub-1", parentFileId: "dir-本地上传", fileName: "x.png" } }), { headers: { "content-type": "application/json" } });
   if (u.includes("/chat/v2/add")) {
     const body = JSON.parse(init.body || "{}");
     seenDialogues.push(body.dialogueInput?.dialogue || "");
+    seenAttachments.push({ attachment: body.dialogueInput?.attachment, command: body.dialogueInput?.command });
     const entry = script[Math.min(chatCalls++, script.length - 1)] ?? "";
     const r = typeof entry === "object" ? entry : { outContent: entry };
     const sse = `data: ${JSON.stringify({ success: true, data: { sessionId: "s", flowResult: { outContent: r.outContent || "", reasoningContent: r.reasoningContent || "" } } })}\n\n`
@@ -52,10 +60,10 @@ const TOOLS = [
   { type: "function", function: { name: "CallDeferredTool", description: "延迟工具", parameters: { type: "object", properties: { tool_name: { type: "string" }, args: { type: "object" } }, required: ["tool_name", "args"] } } },
 ];
 
-async function ask(stream) {
+async function ask(stream, { messages, tools = TOOLS } = {}) {
   const r = await realFetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "blian_qwen38_flash", messages: [{ role: "user", content: "任务" }], tools: TOOLS, stream }),
+    body: JSON.stringify({ model: "blian_qwen38_flash", messages: messages || [{ role: "user", content: "任务" }], tools, stream }),
   });
   if (!stream) {
     const j = await r.json();
@@ -85,7 +93,7 @@ async function ask(stream) {
 
 let pass = 0, fail = 0;
 const ok = (c, m, extra = "") => { c ? (pass++, console.log(`  ✓ ${m}`)) : (fail++, console.log(`  ✗ ${m}${extra ? " → " + extra : ""}`)); };
-const setScript = (arr) => { script = arr; chatCalls = 0; seenDialogues = []; };
+const setScript = (arr) => { script = arr; chatCalls = 0; seenDialogues = []; seenAttachments = []; };
 
 for (const stream of [false, true]) {
   const tag = stream ? "流式" : "非流式";
@@ -194,6 +202,31 @@ for (const stream of [false, true]) {
     for (const c of o.calls) { try { const a = JSON.parse(c.function.arguments); if (typeof a?.payload === "string" && /AAA|BBB/.test(a.payload)) leaked = true; } catch { /* 非法参数不算泄漏 */ } }
     ok(!leaked, "绝不携带半截 payload", "");
     ok(o.calls.length >= 1 && o.calls[0].function.name === "Write", "补发空参数调用保住循环", o.calls.map((c) => c.function.name).join(","));
+  }
+  console.log(`\n=== I. 视觉：image_url → 云盘上传 → attachment（${tag}） ===`);
+  setScript(["图片里是一个红色圆和一个绿色方框。"]);
+  {
+    const tinyPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const o = await ask(stream, {
+      messages: [{ role: "user", content: [{ type: "text", text: "图片里有什么？" }, { type: "image_url", image_url: { url: tinyPng } }] }],
+      tools: null,
+    });
+    const att = seenAttachments.at(-1);
+    ok(att?.attachment?.attachmentTypeList?.[0] === 3, "attachmentTypeList=[3]", JSON.stringify(att?.attachment));
+    ok(att?.attachment?.fileList?.[0]?.fileId === "img-stub-1", "fileList 引用上传 fileId", JSON.stringify(att?.attachment?.fileList));
+    ok(String(att?.attachment?.fileList?.[0]?.name).endsWith(".png"), "图片名带扩展名", att?.attachment?.fileList?.[0]?.name);
+    ok(att?.attachment?.fileList?.[0]?.size > 0, "图片 size 入档", String(att?.attachment?.fileList?.[0]?.size));
+    ok(att?.command?.command === "036" && att?.command?.subCommand === "036006", "command=036/036006", JSON.stringify(att?.command));
+    ok(seenDialogues.at(-1) === "图片里有什么？", "对话文本干净（图片不污染正文）", JSON.stringify(seenDialogues.at(-1)));
+    ok(o.finish === "stop", "正常收尾", o.finish);
+  }
+  console.log(`\n=== I2. 纯文本请求不携带图片附件（${tag}） ===`);
+  setScript(["好的。"]);
+  {
+    await ask(stream, { tools: null });
+    const att = seenAttachments.at(-1);
+    ok(!att?.attachment?.fileList?.length, "attachment 无 fileList", JSON.stringify(att?.attachment));
+    ok(!att?.command, "command 为 null", JSON.stringify(att?.command));
   }
 }
 

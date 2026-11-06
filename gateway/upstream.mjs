@@ -7,7 +7,7 @@
 import crypto from "node:crypto";
 
 const AI_BASE = "https://ai.yun.139.com/api/outer/assistant";
-const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+export const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 const AUTH_ERR_RE = /token|auth|login|session|认证|鉴权|登录|失效|未授权/i;
 
 export class UpstreamError extends Error {
@@ -86,7 +86,7 @@ export class Upstream {
   }
 
   /* ---------- 对话主流程（异步生成器，逐 SSE 事件 yield） ---------- */
-  async *chat({ model, think, dialogue, sessionId = "", webSearch = false, signal }) {
+  async *chat({ model, think, dialogue, sessionId = "", webSearch = false, signal, images = [] }) {
     // 快速路径：模型状态已一致时不必抢锁。否则同一模型的并发请求会互相排队到"首包"，
     // 一个 5 分钟的长思考流会把其他请求一起堵住（线上 p10 速度只有 3 字符/s 就是这个原因）。
     const needSwitch = this._modelState !== `${model}|${think ? 1 : 0}`;
@@ -105,7 +105,8 @@ export class Upstream {
             dialogue,
             prompt: "",
             inputTime: new Date().toISOString(),
-            command: null,
+            // 图片对话的命令码（webui 抓包实锤）：036/036006 = 携带图片附件
+            command: images.length ? { command: "036", subCommand: "036006" } : null,
             resourceType: "0",
             resourceId: "",
             dialogueType: "0",
@@ -113,10 +114,19 @@ export class Upstream {
             enableForceNetworkSearch: !!webSearch,
             enableAllNetworkSearch: false,
             enableAiSearch: false,
-            extInfo: '{"pcVersion":"1.7.0","h5Version":"3.2.0","dialogueType":"noAiEditDialogue"}',
+            extInfo: JSON.stringify({
+              pcVersion: "1.7.0", h5Version: "3.2.0", dialogueType: "noAiEditDialogue",
+              ...(images.length ? { fileName: images[0].name } : {}),
+            }),
             versionInfo: { pcVersion: "1.7.0", h5Version: "3.2.0" },
             toolSetting: { imageToolSetting: { enableLlmDescribe: false } },
-            attachment: {},
+            // 图片附件（webui 抓包实锤）：attachmentTypeList [3] = 图片，file 引用云盘 fileId
+            attachment: images.length
+              ? {
+                  attachmentTypeList: [3],
+                  fileList: images.map((i) => ({ fileId: i.fileId, parentFileId: i.parentFileId, name: i.name, type: "file", size: i.size })),
+                }
+              : {},
             aiWritingSetting: {},
             enableModelThinking: !!think,
             enableKnowledgeAndNetworkSearch: false,

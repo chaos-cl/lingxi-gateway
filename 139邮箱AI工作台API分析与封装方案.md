@@ -273,7 +273,12 @@ sid 失效: 告警 → 人工重新登录邮箱更新 sid+cookies（或接入自
 
 ## 七、后续可深挖
 
-- 视觉模型 `vlm_huoshan_2_0_lite_thinking_vision` 的图片上传协议（`attachment` 结构）
+- ~~视觉模型 `vlm_huoshan_2_0_lite_thinking_vision` 的图片上传协议（`attachment` 结构）~~ ✅ 已逆向并落地（2026-11-07，webui 实抓 + 网关实装，见 `gateway/app.mjs` 视觉支持块）：
+  - **上传**（host `personal-kd-njs.yun.139.com`，鉴权与 AI API 同一个 Basic token，需带全套 mcloud-*/x-yun-* 头，其中 `x-yun-client-info` 必需，缺失报 04000003「请求头不合法」）：
+    1. `POST /hcy/file/create` 建目录链 `/AI空间/灵犀互动记录/本地上传`（`{parentFileId, name, type:"folder", fileRenameMode:"refuse"}`，幂等 exist:true）
+    2. `POST /hcy/file/create` 建文件条目：`{fileRenameMode:"auto_rename", contentType:"application/oct-stream", type:"file", name, size, contentHashAlgorithm:"sha256", contentHash, partInfos:[{parallelHashCtx:{partOffset:0}, partNumber:1, partSize}], parentFileId}` → `data.exist=true` 即 contentHash 秒传命中直接用 `data.fileId`；否则取 `data.uploadId + data.partInfos[].uploadUrl`（AWS SigV4 预签名，eos-wuxi cmecloud）
+    3. `PUT <uploadUrl>` 原始字节 → `POST /hcy/file/complete` `{fileId, uploadId, contentHash, contentHashAlgorithm}` → 文件元数据
+  - **聊天**：`dialogueInput.command = {"command":"036","subCommand":"036006"}` + `dialogueInput.attachment = {"attachmentTypeList":[3], "fileList":[{fileId, parentFileId, name, type:"file", size}]}` + `extInfo.fileName`；**qwen3.8-Max 原生多模态无需切视觉模型**（实测精准识图），Seed-2.0-Lite 仅在模型列表中标注视觉
 - AI搜索（`enableAiSearch`）封装为 `/v1/mail-search` 工具接口——这是该账号独有的私域能力（搜自己的邮件/云盘/笔记）
 - AI写作、AI生成PPT、AI代码助手（webai 内置应用，各自有独立端点）
 - 会话删除/重命名接口（`chat/v2/del` 等，按需抓取）
