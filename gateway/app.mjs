@@ -1219,19 +1219,26 @@ function lastUserText(messages) {
   throw new UpstreamError("messages 中没有 user 消息", { status: 400 });
 }
 
-const estTokens = (chars) => Math.ceil(chars * 0.6); // 粗略估算（仅给"字符数"用，如缓存前缀）
-/** CJK 感知估算：中文约 1.5 字/token，ASCII/代码约 3.5 字/token（统一 0.6 对代码类内容偏差近一倍） */
+/**
+ * 字符 → token 估算（比例对齐 qwen 系 tokenizer 的实测区间）：
+ *   - CJK 汉字/假名（2E80–9FFF、F900–FAFF）：约 1.5 字/token
+ *   - CJK 标点与全角字符（3000–303F、FF00–FFEF）、emoji/符号（2600–27BF、≥0x10000）：基本 1 字 = 1 token
+ *   - 其余（ASCII/代码/拉丁）：约 3.5 字/token
+ * 全网关只用这一把尺子：prompt、completion、缓存命中前缀都用它换算，
+ * 保证 cached_tokens ≤ prompt_tokens 恒成立（旧版缓存用 0.6/字符、prompt 用本函数，
+ * 两把尺子在 ASCII 重的上下文里算出 210% 的"命中率"）。
+ */
 function estTokensText(s) {
   const str = String(s || "");
   if (!str) return 0;
-  let cjk = 0, other = 0;
+  let cjk = 0, punct = 0, other = 0;
   for (const ch of str) {
     const c = ch.codePointAt(0);
-    if (c >= 0x2e80 && c <= 0x9fff || c >= 0xf900 && c <= 0xfaff || c >= 0xff00 && c <= 0xffef) cjk++;
-    else if (c > 0x7f) other++;
+    if ((c >= 0x2e80 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff)) cjk++;
+    else if ((c >= 0x3000 && c <= 0x303f) || (c >= 0xff00 && c <= 0xffef) || c >= 0x10000 || (c >= 0x2600 && c <= 0x27bf)) punct++;
     else other++;
   }
-  return Math.ceil(cjk / 1.5 + other / 3.5);
+  return Math.ceil(cjk / 1.5 + punct + other / 3.5);
 }
 
 /* ---------------- 缓存命中估算 ----------------
@@ -1239,9 +1246,10 @@ function estTokensText(s) {
  * data.flowResult.{outContent,reasoningContent,finishReason,outAuditStatus…}、会话 id 与推荐
  * 追问），139 网页版自身也从未调用任何用量/计费接口 —— 即平台没有把百炼（DashScope）的
  * usage / 隐式上下文缓存计量透传给客户端。因此网关只能估算：
- *   · token 数：按字符估（estTokens）
- *   · 缓存命中：取「同一会话上一轮请求的最长公共前缀」，等价于百炼隐式上下文缓存的理论
- *     命中量（对话逐轮追加时，前缀即上轮全部内容）
+ *   · token 数：estTokensText（字符分桶估算，见函数注释）
+ *   · 缓存命中：取「同一会话上一轮请求的最长公共前缀」的**字符数**，再用 estTokensText
+ *     换算成 token —— 与 prompt_tokens 同一把尺子，cached ≤ prompt 恒成立；前缀即百炼
+ *     隐式上下文缓存的理论命中量（对话逐轮追加时，前缀就是上轮全部内容）
  * 该值标记为非计量值：响应里 x_139.usage_source = "estimated"，便于客户端区分。
  */
 const CACHE_PROMPTS = new Map(); // key → { prompt, at }
@@ -1343,9 +1351,13 @@ async function handleChat(req, res, body, deps) {
 
   // 缓存命中估算（前缀复用）：必须在本轮调用前算，并把本轮 prompt 记为下轮基准。
   // 可缓存前缀 < 1024 token 时百炼不会建立缓存 → 上报 0，避免假命中。
-  const cachePrefixTokens = config.cacheEstimate === false
+  // 命中前缀先记字符数，再与 prompt 用同一把尺子（estTokensText）换算 token：
+  // 旧版缓存走 chars*0.6、prompt 走 CJK 感知估算，两把尺子在 ASCII 重的上下文里
+  // 会算出 >100% 的缓存命中率（cached_tokens > prompt_tokens）
+  const cacheHitChars = config.cacheEstimate === false
     ? 0
-    : estTokens(estimateCacheChars(cacheConvKey(messages, modelObj.id), dialogue));
+    : estimateCacheChars(cacheConvKey(messages, modelObj.id), dialogue);
+  const cachePrefixTokens = cacheHitChars > 0 ? estTokensText(dialogue.slice(0, cacheHitChars)) : 0;
   const cacheTokens = cachePrefixTokens >= CACHE_MIN_TOKENS ? cachePrefixTokens : 0;
 
   // 客户端断开 → 中止上游。

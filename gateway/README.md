@@ -84,6 +84,12 @@ curl http://127.0.0.1:8317/v1/chat/completions -H "Content-Type: application/jso
 
 `thinking.type: "disabled"` 显式关闭；不支持思考开关的模型（GLM-5.3 始终思考、九天）自动忽略。
 
+> **思考强度档位可调吗？——不可调。** 139 上游协议只有布尔开关，没有 effort/budget/档位字段：
+> `reasoning_effort: "low"/"medium"/"high"` 等档位写法会被归一为「开思考」，强度由上游模型自行决定。
+> 查证方式：灵犀网页版 SPA 全量静态分析（主包 + 对话页分包，2026-11），思考相关字段仅
+> `modelThinkingStatus`（chat/config）与 `enableModelThinking`（chat/v2/add），均为 boolean；
+> `effort/budget/strength/level/思考强度` 等关键词全仓零命中。网页版思考按钮只对部分模型显示，且仅开/关两态。
+
 **其他扩展参数**（非标准，可选）：
 
 | 参数 | 作用 |
@@ -158,8 +164,10 @@ sid+cookie ──POST queryUserToken──▶ RCS token(≈25天) ──▶ Basi
 
 | 指标 | 估算方式 | 落盘字段 |
 |---|---|---|
-| `prompt_tokens` / `completion_tokens` | 字符数 × 0.6 | `promptTokens` / `completionTokens` |
-| 缓存命中 `cached_tokens` | **前缀复用**：与同一会话上一轮请求的最长公共前缀 | `cacheTokens` |
+| `prompt_tokens` / `completion_tokens` | 字符分桶估算 `estTokensText`：CJK 汉字 ≈1.5 字/token、CJK 标点与全角字符及 emoji ≈1 字/token、ASCII/代码 ≈3.5 字/token | `promptTokens` / `completionTokens` |
+| 缓存命中 `cached_tokens` | **前缀复用**：与同一会话上一轮请求的最长公共前缀（字符数）× 同一把 `estTokensText` 尺子换算 | `cacheTokens` |
+
+> 缓存命中与 prompt **必须同一把尺子**：曾经缓存按 `字符×0.6`、prompt 按语言分桶，两套换算在 ASCII 重的上下文里算出过 >100% 的"命中率"（cached_tokens > prompt_tokens）。现已统一，`cached ≤ prompt` 恒成立。
 
 **为什么前缀复用等价于缓存命中**：百炼的隐式上下文缓存自动开启、**无法关闭**，机制就是「按最长匹配前缀命中」，命中部分按输入单价的 10%~40% 计费。对话逐轮追加时，上一轮发送的全部内容即本轮 prompt 的前缀 —— 该前缀就是理论上可命中的部分。
 
