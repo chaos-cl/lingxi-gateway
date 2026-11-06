@@ -116,6 +116,24 @@ export function createGateway(opts = {}) {
     }
   }
 
+  /* ---------------- 会话全量日志（data/sessions/） ----------------
+   * 每次对话请求落一个 JSON：完整上游输入（dialogue）、逐轮往返（输出/思考/finish/续写指令）、
+   * 最终 tool_calls / usage / 错误现场。默认开启，保留最近 200 份，旧的自动清理；
+   * GATEWAY_SESSION_LOG=0 或 config.json {"sessionLog": false} 关闭。 */
+  const SESSIONS_DIR = path.join(DATA_SUBDIR, "sessions");
+  const SESSION_KEEP = 200;
+  const writeSessionLog = (rec) => {
+    if (!rec) return;
+    try {
+      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+      fs.writeFileSync(path.join(SESSIONS_DIR, `${rec.ts.replace(/[:.]/g, "-")}-${rec.id || "req"}.json`), JSON.stringify(rec));
+      const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json")).sort();
+      for (const f of files.slice(0, Math.max(0, files.length - SESSION_KEEP))) {
+        try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
+      }
+    } catch { /* 日志失败不影响请求 */ }
+  };
+
   const getCredentials = () => readJsonFile(CRED_FILE, { sid: creds.sid || "", cookie: creds.cookie || "" });
   const saveCredentials = (c) => {
     creds.sid = c.sid ?? creds.sid;
@@ -1444,9 +1462,50 @@ async function handleChat(req, res, body, deps) {
   let toolCallCount = 0;
   let toolChars = 0; // 工具调用（名字+参数 JSON）的字符数：计入 completion 用量，否则带工具的轮次 completion=0、TPS 显示为 0
   let lastFinish = "";
+
+  /* ---- 会话全量日志（data/sessions/）：逐轮往返追踪 ---- */
+  const sess = config.sessionLog === false ? null : {
+    ts: new Date().toISOString(),
+    id, model: modelObj.id, modelName: modelObj.name,
+    think: !!think, webSearch: !!webSearch, stream,
+    sessionId: String(sessionId),
+    toolNames: allowedTools, toolChoice: choice,
+    promptChars: dialogue.length,
+    dialogue, // 完整上游输入（渲染后的对话 + 工具说明）
+    rounds: [], // 每次 /chat/v2/add 往返一条：{ kind, note, out, reasoning, finish, ms }
+  };
+  let curRound = null;
+  let roundNote = ""; // 下一轮对话相对基础 dialogue 的附加指令（续写/强制/催促），beginRound 消费后清空
+  let roundKind = ""; // 下一轮的轮次类型（retry/prose-continuation/tool-choice-forced/tool-repair/nudge）
+  const shortNote = (s) => String(s || "").slice(0, 300);
+  const beginRound = (kind, note = "") => {
+    curRound = { kind, note: String(note || ""), out: "", reasoning: "", finish: "", at: Date.now() };
+    roundNote = "";
+    roundKind = "";
+  };
+  const endRound = () => {
+    if (curRound) {
+      curRound.ms = Date.now() - curRound.at;
+      if (sess) sess.rounds.push(curRound);
+    }
+    curRound = null;
+  };
+  const sessToolCalls = []; // 最终下发给客户端的 tool_calls（流式在 emit 时收，非流式在提取后收）
+
   // 请求收尾：日志 + 用量落盘（流式与非流式都必须走到，历史上非流式漏记）
   const finalize = () => {
     log(`[chat] ${modelObj.name}${think ? "+think" : ""}${webSearch ? "+search" : ""}${toolCallCount ? "+tools(" + toolCallCount + ")" : ""} | ${sessionId ? "续会话" : "新会话"} ${sidOut || ""} | ${content.length}字 finish=${lastFinish || "-"}${cacheTokens ? " 缓存≈" + cacheTokens + "tok" : ""} ${Date.now() - t0}ms`);
+    // 会话全量日志：完整输入 + 逐轮往返 + 最终输出（data/sessions/，排查截断/畸形/续写行为用）
+    if (sess) {
+      sess.content = content;
+      sess.reasoning = reasoning;
+      sess.toolCalls = sessToolCalls;
+      sess.finish = lastFinish || (sessToolCalls.length ? "tool_calls" : "stop");
+      sess.usage = usageBlock();
+      sess.ms = Date.now() - t0;
+      sess.x139 = { session_id: sidOut, model_used: modelUsed, statement };
+      writeSessionLog(sess);
+    }
     // 原始抓包（排查上游截断/畸形输出用）：LINGXI_CAPTURE_DIR=/path 打开
     if (process.env.LINGXI_CAPTURE_DIR) {
       try {
@@ -1478,10 +1537,12 @@ async function handleChat(req, res, body, deps) {
       let attemptDialogue = dialogue;
       for (let attempt = 0; attempt < 3; attempt++) {
         const opts = { ...chatOpts, dialogue: attemptDialogue };
+        beginRound(attempt === 0 ? "initial" : (roundKind || "retry"), attempt === 0 ? "" : roundNote);
         for await (const ev of upstream.chat(opts)) {
           collect(ev);
           armIdle();
         }
+        endRound();
         // 把写进正文的 <thinking> 拆到 reasoning，正文才算"真输出"
         const sp = new ThinkingSplitter();
         const spell = [...sp.feed(content), ...sp.flush()];
@@ -1497,6 +1558,7 @@ async function handleChat(req, res, body, deps) {
           const truncTail = extractor.truncatedTail();
           if (truncTail && attempt < 2) {
             log(`[chat] 工具调用被截断（块尾「${truncTail.slice(-40)}」），自动续写补全`);
+            beginRound("tool-repair", shortNote(toolContinuationDirective(truncTail)));
             let extra = "";
             for await (const ev of upstream.chat({ ...chatOpts, dialogue: dialogue + toolContinuationDirective(truncTail) })) {
               collect(ev, { textInto: false }); // 续写是隐藏修复轮：不并入正文/思考，只取输出
@@ -1505,12 +1567,15 @@ async function handleChat(req, res, body, deps) {
               if (fr.outContent) extra += fr.outContent;
               if (fr.finishReason === "stop") break;
             }
+            endRound();
             events.push(...extractor.feed(extra));
           }
           events.push(...extractor.flush());
           content = events.filter((e) => e.type === "text").map((e) => e.text).join("");
           toolCallsOut = events.filter((e) => e.type === "tool_call").map((e) => normalizeToolCall(e.call)).filter(Boolean);
           toolCallCount = toolCallsOut.length;
+          sessToolCalls.length = 0;
+          sessToolCalls.push(...toolCallsOut);
           toolChars += toolCallsOut.reduce((n, c) => n + (c.function?.name?.length || 0) + (c.function?.arguments?.length || 0), 0);
         }
         // tool_choice 强制但模型只回了文字：非流式尚未出网，丢弃后带更强指令重试一次
@@ -1519,12 +1584,16 @@ async function handleChat(req, res, body, deps) {
           content = "";
           reasoning = "";
           attemptDialogue = dialogue + "\n\n（系统提示：你上一轮没有发起工具调用，违反了强制要求。本轮必须首先输出 <tool_call> 块调用工具，不要再输出任何纯文字内容。）";
+          roundNote = "tool_choice 强制重试指令";
+          roundKind = "tool-choice-forced";
           continue;
         }
         // 句中截断（长思考后短正文、无句读结尾 / 围栏未闭合）：自动续写并拼回同一份回复
         if (attempt < 2 && !toolCallsOut.length && looksTruncatedStop(content, reasoning)) {
           log(`[chat] 疑似句中截断（思考 ${reasoning.length} 字 / 正文 ${content.trim().length} 字、无句读结尾），自动续写`);
           attemptDialogue = dialogue + continuationDirective(content);
+          roundNote = shortNote(continuationDirective(content));
+          roundKind = "prose-continuation";
           continue;
         }
         // 只吐出思考 / 什么都没吐，且本可以用工具 → 续写一次，避免 agent 轮次被掐断
@@ -1533,6 +1602,8 @@ async function handleChat(req, res, body, deps) {
         log("[chat] 空回复（只有思考），自动续写一次");
         content = "";
         attemptDialogue = dialogue + NUDGE_TEXT;
+        roundNote = shortNote(NUDGE_TEXT);
+        roundKind = "nudge";
       }
       clearTimers();
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", ...(sidOut ? { "x-139-session-id": sidOut } : {}) });
@@ -1575,6 +1646,7 @@ async function handleChat(req, res, body, deps) {
           sawToolCall = true;
           toolCallCount++;
           toolChars += (call.function?.name?.length || 0) + (call.function?.arguments?.length || 0);
+          sessToolCalls.push(call);
           res.write(`data: ${JSON.stringify(baseChunk({ tool_calls: [call] }))}\n\n`);
         }
       }
@@ -1605,6 +1677,7 @@ async function handleChat(req, res, body, deps) {
     for (let attempt = 0; attempt < 3; attempt++) {
       const contentAtStart = content.length;
       const callsAtStart = toolCallCount;
+      beginRound(attempt === 0 ? "initial" : (roundKind || "retry"), attempt === 0 ? "" : roundNote);
       for await (const ev of upstream.chat({ ...chatOpts, dialogue: attemptDialogue })) {
         armIdle();
         const hadCitations = citations.length > 0;
@@ -1621,6 +1694,7 @@ async function handleChat(req, res, body, deps) {
         }
         if (fr.finishReason === "stop") break;
       }
+      endRound();
       for (const se of splitter.flush()) applySplit(se); // 冲出本轮残留（未闭合思考按 reasoning 处理）
       splitter.reset(); // 下一轮是独立请求，不能沿用未闭合的 <thinking> 状态
       // 工具调用块被上游截断（未闭合自停）：定向续写补全，输出仍喂进同一个提取器
@@ -1629,6 +1703,8 @@ async function handleChat(req, res, body, deps) {
       if (truncTail && attempt < 2) {
         log(`[chat] 工具调用被截断（块尾「${truncTail.slice(-40)}」），自动续写补全`);
         attemptDialogue = dialogue + toolContinuationDirective(truncTail);
+        roundNote = shortNote(toolContinuationDirective(truncTail));
+        roundKind = "tool-repair";
         continue;
       }
       const produced = content.length > contentAtStart || toolCallCount > callsAtStart;
@@ -1636,10 +1712,14 @@ async function handleChat(req, res, body, deps) {
       if (produced && attempt < 2 && toolCallCount === callsAtStart && looksTruncatedStop(content, reasoning)) {
         log(`[chat] 疑似句中截断（思考 ${reasoning.length} 字 / 正文 ${content.trim().length} 字、无句读结尾），自动续写`);
         attemptDialogue = dialogue + continuationDirective(content);
+        roundNote = shortNote(continuationDirective(content));
+        roundKind = "prose-continuation";
         continue;
       }
       if (produced || !tools.length || attempt === 2) break;
       attemptDialogue = dialogue + NUDGE_TEXT;
+      roundNote = shortNote(NUDGE_TEXT);
+      roundKind = "nudge";
       log("[chat] 空回复（只有思考），自动续写一次");
     }
     if (extractor) emitTextEvents(extractor.flush()); // 流结束：冲出残余文本/未闭合的 tool_call
@@ -1682,6 +1762,17 @@ async function handleChat(req, res, body, deps) {
       elapsedMs: Date.now() - t0, toolCalls: 0,
     });
     log(cancelled ? `[chat] 客户端取消（已生成 ${content.length} 字）` : `[chat] 失败: ${message}`);
+    // 错误/取消现场也入会话日志（含已发生的往返轮次），便于定位上游故障
+    if (sess) {
+      sess.content = content;
+      sess.reasoning = reasoning;
+      sess.toolCalls = sessToolCalls;
+      sess.finish = lastFinish || "";
+      sess.ms = Date.now() - t0;
+      sess.error = String(message).slice(0, 500);
+      if (cancelled) sess.cancelled = true;
+      writeSessionLog(sess);
+    }
     return;
   }
 
@@ -1691,6 +1782,11 @@ async function handleChat(req, res, body, deps) {
     const d = ev.data || {};
     if (d.sessionId) sidOut = d.sessionId;
     const fr = d.flowResult || {};
+    if (curRound) {
+      if (fr.outContent) curRound.out += fr.outContent;
+      if (fr.reasoningContent) curRound.reasoning += fr.reasoningContent;
+      if (fr.finishReason) curRound.finish = fr.finishReason;
+    }
     if (textInto && fr.outContent) content += fr.outContent;
     if (textInto && fr.reasoningContent) reasoning += fr.reasoningContent;
     if (fr.finishReason) lastFinish = fr.finishReason;

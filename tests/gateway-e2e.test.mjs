@@ -169,6 +169,18 @@ for (const stream of [false, true]) {
     ok(seenDialogues[1]?.includes("被意外截断"), "续写请求携带截断指令", (seenDialogues[1] || "").slice(-80));
     ok(seenDialogues[1]?.includes("payload\": \"计划：第一"), "指令携带截断块尾部原文", (seenDialogues[1] || "").slice(-100));
     ok(!o.text.includes("[网关]"), "无失败提示文本", o.text.slice(0, 60));
+    // 会话全量日志（data/sessions/）：完整输入 + 逐轮往返 + 最终 tool_calls
+    const sessDir = path.join(DATA, "data", "sessions");
+    const sessFiles = fs.readdirSync(sessDir).filter((f) => f.endsWith(".json")).sort();
+    ok(sessFiles.length >= 1, "会话日志已落盘", `${sessFiles.length} 份`);
+    const sessRec = JSON.parse(fs.readFileSync(path.join(sessDir, sessFiles.at(-1)), "utf8"));
+    ok(sessRec.dialogue?.includes("任务"), "完整上游输入已入档", (sessRec.dialogue || "").slice(0, 40));
+    ok(sessRec.rounds?.length === 2, "两轮上游往返（初始 + 截断修复）", `got ${sessRec.rounds?.length}`);
+    ok(sessRec.rounds?.[0]?.kind === "initial" && sessRec.rounds?.[1]?.kind === "tool-repair", "轮次类型标记正确", sessRec.rounds?.map((r) => r.kind).join(","));
+    ok((sessRec.rounds?.[1]?.note || "").includes("被意外截断"), "修复轮指令入档", (sessRec.rounds?.[1]?.note || "").slice(0, 60));
+    ok((sessRec.rounds?.[1]?.out || "").includes("第二步填充数据"), "修复轮输出入档", (sessRec.rounds?.[1]?.out || "").slice(0, 40));
+    ok(sessRec.toolCalls?.[0]?.function?.name === "Write", "最终 tool_calls 入档", sessRec.toolCalls?.[0]?.function?.name);
+    ok(sessRec.usage?.total_tokens > 0, "usage 入档", JSON.stringify(sessRec.usage?.total_tokens));
   }
   console.log(`\n=== H. 工具调用截断 + 续写仍截断 → 回退空参数补发（${tag}） ===`);
   setScript([

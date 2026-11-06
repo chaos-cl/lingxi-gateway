@@ -29,6 +29,7 @@ OpenBitFun / OpenAI SDK / Claude Code / Cherry Studio …
 | 👤 **账号连接** | 桌面版内置登录助手：App 内登录 139 邮箱 → 自动读取 httpOnly cookie → 验证铸造 → 保存，**无需手工导出凭据** |
 | ♻️ **自动续期** | Token 约 25 天有效，到期前 1 天自动重铸；支持一键手动续期与会话过期提醒 |
 | 📈 **调用统计** | 按模型 × 按天的调用量、输入/输出字数、估算 tokens、平均耗时、成功率；近 7/14/30/90 天趋势 |
+| 🗂 **会话全量日志** | 每次请求落盘 `data/sessions/`：完整上游输入、逐轮往返（含续写/修复指令与原始输出）、最终 tool_calls、错误现场；保留最近 200 份，`GATEWAY_SESSION_LOG=0` 可关 |
 | 🪶 **零运行时依赖** | 网关主体是纯 Node 18+ ESM（无 npm 依赖），可直接 `node gateway/server.mjs` 运行 |
 
 ---

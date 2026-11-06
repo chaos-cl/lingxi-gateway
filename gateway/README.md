@@ -184,6 +184,22 @@ sid+cookie ──POST queryUserToken──▶ RCS token(≈25天) ──▶ Basi
 - 关闭估算：环境变量 `GATEWAY_CACHE_ESTIMATE=0`，或 `config.json` 写 `{"cacheEstimate": false}`
   （关闭后仍会发送 `cached_tokens: 0`，客户端通常显示为「未上报缓存」）
 
+## 会话全量日志（data/sessions/）
+
+每次对话请求落一个 JSON（默认开启，保留最近 200 份，旧的自动清理），记录排查问题所需的完整现场：
+
+| 字段 | 内容 |
+|---|---|
+| `dialogue` | 发给上游的**完整渲染输入**（多轮转录稿 + 工具说明 + 强制/续写指令） |
+| `rounds[]` | 每次上游往返一条：`kind`（initial / retry / prose-continuation / tool-choice-forced / tool-repair / nudge）、`note`（续写指令原文）、`out` / `reasoning`（该轮原始输出）、`finish`、`ms` |
+| `toolCalls` | 最终下发给客户端的结构化调用（与客户端看到的一致） |
+| `content` / `reasoning` / `usage` / `finish` / `ms` | 最终响应与用量估算 |
+| `error` / `cancelled` | 失败/取消现场（含已发生的轮次） |
+
+- 位置：`<数据目录>/data/sessions/`（CLI 为 `gateway/data/sessions/`，桌面版在 `%APPDATA%\灵犀网关\data\sessions\`）
+- 关闭：环境变量 `GATEWAY_SESSION_LOG=0`，或 `config.json` 写 `{"sessionLog": false}`
+- 隐私提示：日志包含完整对话内容，仅落本地盘（该目录已在 .gitignore 内），排查完可整目录删除
+
 > **想要真实计量**只能从调用方（139/中国移动）的百炼账号侧取：百炼控制台 →「模型监控」的
 > `cache_tokens` 指标，或「账单明细」按计费类型筛选「缓存命中」。本网关拿不到该账号。
 

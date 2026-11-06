@@ -29,5 +29,10 @@ export function loadConfig(dir = DIR) {
     cacheEstimate: process.env.GATEWAY_CACHE_ESTIMATE
       ? process.env.GATEWAY_CACHE_ESTIMATE !== "0"
       : cfgFile.cacheEstimate !== false,
+    // 会话全量日志（data/sessions/，每请求一个 JSON：上游输入 + 逐轮输出 + 最终 tool_calls；保留最近 200 份）
+    // GATEWAY_SESSION_LOG=0 或 config.json {"sessionLog": false} 关闭
+    sessionLog: process.env.GATEWAY_SESSION_LOG
+      ? process.env.GATEWAY_SESSION_LOG !== "0"
+      : cfgFile.sessionLog !== false,
   };
 }
